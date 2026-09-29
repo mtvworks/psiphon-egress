@@ -33,7 +33,11 @@ set -euo pipefail
 # and nothing announces it. A digest is reproducible — `--image ref:tag` still
 # accepts a moving tag for anyone who wants one, with a warning.
 IMAGE_DEFAULT_DIGEST="sha256:26bb31230f2c99defcb4f1e3d912037aeba0971333a17eb55b37f3e5bf7f69c0"
-IMAGE="${IMAGE:-swarupsengupta2007/psiphon@$IMAGE_DEFAULT_DIGEST}"
+IMAGE_DEFAULT="swarupsengupta2007/psiphon@$IMAGE_DEFAULT_DIGEST"
+# Asked for (flag or environment) or not: an image moved on by `vps-psiphon
+# update-image` must survive a reinstall, not be rolled back to the digest shipped here.
+IMAGE_SET=0; [ -n "${IMAGE:-}" ] && IMAGE_SET=1
+IMAGE="${IMAGE:-$IMAGE_DEFAULT}"
 NAME="${NAME:-vps-psiphon}"
 
 # Container ceilings. A tunnel that leaks must not take the node down with it: on a
@@ -67,6 +71,13 @@ DENY_REGIONS=""; DENY_REGIONS_SET=0
 # location. Empty computes to everything requested plus US; "any" accepts every
 # verdict. The reasoning sits beside ACCEPT_REGIONS in the env file below.
 ACCEPT_REGIONS=""; ACCEPT_REGIONS_SET=0
+# Optional Telegram alerts from the watchdog (rotation, denied country). Both empty =
+# off. Kept across reinstalls unless given again; '' turns them off.
+TG_TOKEN=""; TG_TOKEN_SET=0; TG_CHAT=""; TG_CHAT_SET=0
+# node_exporter textfile collector directory for the watchdog's metrics. Unset means:
+# keep the stored value, else use the collector's usual directory if it exists.
+METRICS_DIR=""; METRICS_DIR_SET=0
+METRICS_DIR_DEFAULT=/var/lib/node_exporter/textfile_collector
 
 CONF_DIR=/opt/vps-psiphon/config
 ENVF=/etc/default/vps-psiphon
@@ -149,6 +160,13 @@ psiphon_install.sh [options]
   --memory SIZE        container memory ceiling (default 512m)
   --pids-limit N       container pid ceiling (default 256)
   --no-watchdog        skip the watchdog
+  --tg-token TOKEN     Telegram bot token for watchdog alerts (rotations, denied
+  --tg-chat ID         country). Both are needed; '' turns alerts off. Kept across
+                       reinstalls. Test with: vps-psiphon notify-test
+  --metrics-dir DIR    where the watchdog writes vps-psiphon.prom for the
+                       node_exporter textfile collector. Default: kept from the
+                       last install, else /var/lib/node_exporter/textfile_collector
+                       if it exists. '' turns metrics off.
 U
 }
 
@@ -180,7 +198,10 @@ while [ $# -gt 0 ]; do
     --bind)          BIND="${2:?}";          shift 2 ;;
 
     --bind-loopback) BIND=127.0.0.1;         shift   ;;
-    --image)         IMAGE="${2:?}";         shift 2 ;;
+    --image)         IMAGE="${2:?}"; IMAGE_SET=1; shift 2 ;;
+    --tg-token)      TG_TOKEN="${2:-}"; TG_TOKEN_SET=1; shift 2 ;;
+    --tg-chat)       TG_CHAT="${2:-}";  TG_CHAT_SET=1;  shift 2 ;;
+    --metrics-dir)   METRICS_DIR="${2:-}"; METRICS_DIR_SET=1; shift 2 ;;
     --memory)        MEM_LIMIT="${2:?}";     shift 2 ;;
     --pids-limit)    PIDS_LIMIT="${2:?}";    shift 2 ;;
     --no-watchdog)   WATCHDOG=0;             shift   ;;
@@ -212,6 +233,16 @@ printf '%s\n' "$MEM_LIMIT"  | grep -qxE '[0-9]+[bkmgBKMG]?' || die "--memory: '$
 printf '%s\n' "$PIDS_LIMIT" | grep -qxE '[0-9]+'            || die "--pids-limit: '$PIDS_LIMIT' is not a number"
 printf '%s\n' "$IMAGE"      | grep -qxE '[A-Za-z0-9._/:@-]+' || die "--image: '$IMAGE' is not an image reference"
 printf '%s\n' "$NAME"       | grep -qxE '[A-Za-z0-9][A-Za-z0-9_.-]*' || die "NAME: '$NAME' is not a container name"
+# Checked again after the stored values are restored, since those are sourced too.
+check_extras() {
+  [ -z "$TG_TOKEN" ] || printf '%s\n' "$TG_TOKEN" | grep -qxE '[0-9]+:[A-Za-z0-9_-]+' \
+    || die "--tg-token: not a bot token (digits:letters, as BotFather prints it)"
+  [ -z "$TG_CHAT" ] || printf '%s\n' "$TG_CHAT" | grep -qxE -e '-?[0-9]+|@[A-Za-z0-9_]+' \
+    || die "--tg-chat: expected a numeric chat id or @channelname"
+  [ -z "$METRICS_DIR" ] || printf '%s\n' "$METRICS_DIR" | grep -qxE '/[A-Za-z0-9._/-]*' \
+    || die "--metrics-dir: expected an absolute path"
+}
+check_extras
 
 # ---------------------------------------------------------------- preflight --
 [ "$(id -u)" = 0 ] || die "run as root"
@@ -221,6 +252,8 @@ command -v curl >/dev/null || die "curl is not installed"
 # Without ss every port reads as free, and a collision surfaces only as a unit that
 # loops on a bind error after the install has claimed success.
 command -v ss >/dev/null || die "ss is not installed (package iproute2) — needed to check the ports"
+# The watchdog and the CLI's rotate/region/update-image serialise on one lock.
+command -v flock >/dev/null || die "flock is not installed (package util-linux)"
 
 # ------------------------------------------------------------- bind address --
 # Where the SOCKS5 is published decides whether the kernel can carry it. Docker
@@ -333,7 +366,29 @@ if [ -r "$ENVF" ]; then
     [ -n "$V" ] && EGRESS_REGION="$(cc_list "$V")" && [ "$EGRESS_REGION" = "${EGRESS_REGION%% *}" ] \
       || EGRESS_REGION=""
   fi
+  # Values quoted in the file ('…') come back with the quotes stripped.
+  stored() { sed -n "s/^$1=//p" "$ENVF" | head -1 | tr -d "'"; }
+  if [ "$IMAGE_SET" = 0 ]; then
+    V="$(stored IMAGE)"
+    if [ -n "$V" ] && [ "$V" != "$IMAGE" ]; then
+      say "keeping image $V from the previous install (this script's default: $IMAGE)"
+      say "    move it with 'vps-psiphon update-image', or re-run with --image"
+      IMAGE="$V"
+    fi
+  fi
+  [ "$TG_TOKEN_SET" = 1 ]    || TG_TOKEN="$(stored TG_TOKEN)"
+  [ "$TG_CHAT_SET" = 1 ]     || TG_CHAT="$(stored TG_CHAT)"
+  # A line present but empty is a decision (metrics off) and survives; no line at all
+  # is an install older than the option, which gets the default below.
+  if [ "$METRICS_DIR_SET" = 0 ] && grep -q '^METRICS_DIR=' "$ENVF"; then
+    METRICS_DIR="$(stored METRICS_DIR)"; METRICS_DIR_SET=1
+  fi
 fi
+if [ "$METRICS_DIR_SET" = 0 ] && [ -d "$METRICS_DIR_DEFAULT" ]; then
+  METRICS_DIR="$METRICS_DIR_DEFAULT"
+fi
+printf '%s\n' "$IMAGE" | grep -qxE '[A-Za-z0-9._/:@-]+' || die "IMAGE '$IMAGE' in $ENVF is not an image reference"
+check_extras
 is_port "$SOCKS_PORT" || die "SOCKS_PORT '$SOCKS_PORT' in $ENVF is not a port number"
 is_port "$HTTP_PORT"  || die "HTTP_PORT '$HTTP_PORT' in $ENVF is not a port number"
 
@@ -480,6 +535,11 @@ if [ -n "$OLD_BIND" ] && [ "$OLD_BIND" != "$BIND" ]; then
   echo
 fi
 
+# Created 0600 before anything is written into it: it may carry a bot token, and
+# `cat >` onto a fresh file under the default umask leaves it world-readable until the
+# chmod below.
+[ -e "$ENVF" ] || install -m 600 /dev/null "$ENVF"
+chmod 600 "$ENVF"
 cat > "$ENVF" <<EOF
 # vps-psiphon — written by psiphon_install.sh
 IMAGE=$IMAGE
@@ -556,6 +616,15 @@ REGION_POOL='$REGION_POOL'
 # computed default — everything requested, plus US. The word any accepts every verdict.
 # Sanctioned regions are rejected either way: deny is checked first.
 ACCEPT_REGIONS='$ACCEPT_REGIONS'
+# Telegram alerts from the watchdog: a rotation (with its reason and the new exit), a
+# denied country the first time it is seen, a rotation that did not bring the tunnel
+# back. Sent directly, not through the tunnel. Both empty = off.
+# Test with: vps-psiphon notify-test
+TG_TOKEN='$TG_TOKEN'
+TG_CHAT='$TG_CHAT'
+# node_exporter textfile collector directory; the watchdog writes vps-psiphon.prom
+# there after every check. Empty = off.
+METRICS_DIR='$METRICS_DIR'
 EOF
 chmod 600 "$ENVF"
 
@@ -612,6 +681,7 @@ cat > /usr/local/sbin/vps-psiphon-advance-region <<'ADV'
 # wipes the config directory and the client's cached server list with it.
 set -uo pipefail
 ENVF=/etc/default/vps-psiphon
+# shellcheck source=/dev/null
 [ -r "$ENVF" ] && . "$ENVF"
 [ -n "${REGION_POOL:-}" ] || exit 0
 
@@ -669,7 +739,29 @@ S=(--socks5-hostname "${BIND:-127.0.0.1}:${SOCKS_PORT}")
 touch "$LOG" 2>/dev/null
 log() { printf '%s %s\n' "$(date -Is)" "$*" >> "$LOG"; }
 
-fails=0; last_rotate=0; captcha=0; window=""
+# One writer at a time. `vps-psiphon rotate`, `region` and `update-image` take the same
+# lock: without it a manual rotate landing mid-check restarts the tunnel twice, and
+# both sides rewrite the state and env files under each other. A check that finds the
+# lock taken is skipped, not queued — the next timer tick is ten minutes away.
+exec 9>/run/vps-psiphon.lock
+if ! flock -n 9; then
+  log "skipped: a rotate, region change or image update is in progress"
+  exit 0
+fi
+
+# Telegram, sent directly rather than through the tunnel: an alert about a dead tunnel
+# must not depend on it. The token is part of the URL, so it reaches curl through a
+# config on stdin — never argv, where any local user could read it in ps.
+notify() {
+  [ -n "${TG_TOKEN:-}" ] && [ -n "${TG_CHAT:-}" ] || return 0
+  printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$TG_TOKEN" \
+    | curl -s -o /dev/null --max-time 10 -K - \
+        --data-urlencode "chat_id=${TG_CHAT}" \
+        --data-urlencode "text=vps-psiphon @ $(hostname): $*" >/dev/null 2>&1 || true
+}
+
+fails=0; last_rotate=0; captcha=0; window=""; rotations=0; last_reason=""; denied_gl=""
+# shellcheck source=/dev/null
 [ -r "$STATE" ] && . "$STATE"
 
 alive=0
@@ -694,8 +786,11 @@ else
   # APPENDED to that output: "12345 200" followed by "0 000" reads back as status 000,
   # and a transfer that had its response and ran out of time judged as a stall. Only an
   # empty or malformed answer falls back.
+  # Its exit status is kept: 28 is curl giving up at --max-time, which tells a slow
+  # transfer that had its response apart from one that finished.
   probe="$(LC_ALL=C curl -s --max-time 25 "${S[@]}" -H 'Accept-Language: en-US' \
-           -o "$ytf" -w '%{speed_download} %{http_code}' https://www.youtube.com/ 2>/dev/null || true)"
+           -o "$ytf" -w '%{speed_download} %{http_code}' https://www.youtube.com/ 2>/dev/null)"
+  yrc=$?
   spd="${probe%% *}"; spd="${spd%%.*}"; ytcode="${probe##* }"
   case "$spd" in ''|*[!0-9]*) spd=0 ;; esac
   case "$ytcode" in [0-9][0-9][0-9]) : ;; *) ytcode=000 ;; esac
@@ -710,6 +805,11 @@ else
     case " ${DENY_REGIONS:-} " in
       *" $gl "*) reason="denied-country (Google sees $gl — sanctioned or Google-blocked)"; denied=1 ;;
     esac
+    # Alerted once per country, not on every check until the rotation lands.
+    if [ "$denied" = 1 ] && [ "$denied_gl" != "$gl" ]; then
+      notify "exit is seen as $gl (denied) — rotating once the failure window fills"
+    fi
+    [ "$denied" = 1 ] && denied_gl="$gl" || denied_gl=""
     # What we ASK Psiphon for and what we ACCEPT from Google are different lists:
     # Google rewrites many exits to US whatever country they report, so judging the
     # verdict against the request rotated a fast, healthy FR exit away for nothing.
@@ -765,6 +865,19 @@ else
       fi
     fi
   fi
+  # A response that arrived but could not finish in 25 s is slow whatever its size.
+  # Below 50 KB the rate gate above does not look at it, and it is not a stall either —
+  # so without this it passed as healthy. Part of the throughput gate: off with it, and
+  # held back during the same grace period. A captcha is small and finishes at once,
+  # so it never lands here.
+  if [ -z "$reason" ] && [ "$yrc" = 28 ] && [ "$ytcode" != 000 ] \
+     && [ "${MIN_THROUGHPUT_KBPS:-0}" -gt 0 ]; then
+    if [ "$up_for" -lt "${THROUGHPUT_GRACE_SEC:-900}" ]; then
+      log "timed out at ${kbps} KB/s but the tunnel is ${up_for}s old — still ramping, not judged"
+    else
+      reason="slow-tunnel (timed out after 25s at ${kbps} KB/s, ${got} bytes)"
+    fi
+  fi
   # Informational only, and logged on change so a captcha'd exit does not fill the log.
   rd="$(curl -s -o /dev/null --max-time 25 "${S[@]}" -w '%{redirect_url}' \
         'https://www.google.com/search?q=status' 2>/dev/null || true)"
@@ -791,6 +904,7 @@ fi
 [ "${#window}" -gt "${FAIL_WINDOW:-5}" ] && window="${window: -${FAIL_WINDOW:-5}}"
 ones="${window//0/}"; fails="${#ones}"
 [ -n "$reason" ] && log "check failed ($reason), $fails of the last ${#window} checks"
+[ -n "$reason" ] && last_reason="$reason"
 # Always record the rate: this is the history that makes a slow decline legible.
 [ -n "$kbps" ] && log "throughput ${kbps} KB/s (country ${gl:-?})"
 
@@ -804,13 +918,75 @@ if [ "$fails" -ge "${FAIL_THRESHOLD:-2}" ] && [ $((now - last_rotate)) -ge "${RO
   sleep 45
   new="$(curl -s --max-time 20 "${S[@]}" https://api.ipify.org 2>/dev/null || echo '?')"
   log "rotated: $old -> $new"
-  fails=0; window=""; last_rotate=$now
+  if [ -z "$new" ] || [ "$new" = '?' ]; then
+    notify "rotated away from $old (${last_reason:-?}) — and the new tunnel does not answer yet"
+  else
+    notify "rotated $old -> $new${moved:+, region $moved} (${last_reason:-?})"
+  fi
+  fails=0; window=""; last_rotate=$now; rotations=$((rotations + 1)); denied_gl=""
 fi
 
-printf 'fails=%s\nlast_rotate=%s\ncaptcha=%s\nwindow=%s\n' "$fails" "$last_rotate" "$captcha" "$window" > "$STATE"
+# %q: the reason carries spaces, quotes and parentheses, and this file is sourced.
+printf 'fails=%s\nlast_rotate=%s\ncaptcha=%s\nwindow=%s\nrotations=%s\nlast_reason=%q\ndenied_gl=%s\n' \
+  "$fails" "$last_rotate" "$captcha" "$window" "$rotations" "$last_reason" "$denied_gl" > "$STATE"
+
+# node_exporter textfile collector. Written to a temporary file in the same directory
+# and renamed, so a scrape never reads half a file.
+if [ -n "${METRICS_DIR:-}" ] && [ -d "$METRICS_DIR" ]; then
+  mf="$(mktemp "$METRICS_DIR/.vps-psiphon.prom.XXXXXX" 2>/dev/null)" && {
+    {
+      echo '# HELP vps_psiphon_up 1 if the SOCKS5 liveness probe succeeded on the last check.'
+      echo '# TYPE vps_psiphon_up gauge'
+      echo "vps_psiphon_up $alive"
+      echo '# HELP vps_psiphon_check_ok 1 if the last check found nothing to rotate for.'
+      echo '# TYPE vps_psiphon_check_ok gauge'
+      echo "vps_psiphon_check_ok $([ -z "$reason" ] && echo 1 || echo 0)"
+      if [ -n "$kbps" ]; then
+        echo '# HELP vps_psiphon_throughput_kbps Rate of the watchdog YouTube fetch, KB/s.'
+        echo '# TYPE vps_psiphon_throughput_kbps gauge'
+        echo "vps_psiphon_throughput_kbps $kbps"
+      fi
+      echo '# HELP vps_psiphon_window_failures Failed checks within the failure window.'
+      echo '# TYPE vps_psiphon_window_failures gauge'
+      echo "vps_psiphon_window_failures $fails"
+      echo '# HELP vps_psiphon_rotations_total Rotations made by the watchdog.'
+      echo '# TYPE vps_psiphon_rotations_total counter'
+      echo "vps_psiphon_rotations_total $rotations"
+      echo '# HELP vps_psiphon_last_rotate_timestamp_seconds Time of the last watchdog rotation.'
+      echo '# TYPE vps_psiphon_last_rotate_timestamp_seconds gauge'
+      echo "vps_psiphon_last_rotate_timestamp_seconds $last_rotate"
+      echo '# HELP vps_psiphon_captcha 1 if Google serves a captcha to this exit.'
+      echo '# TYPE vps_psiphon_captcha gauge'
+      echo "vps_psiphon_captcha $captcha"
+      if [ -n "$gl" ]; then
+        echo "# HELP vps_psiphon_country_info Google's country verdict about this exit."
+        echo '# TYPE vps_psiphon_country_info gauge'
+        echo "vps_psiphon_country_info{gl=\"$gl\"} 1"
+      fi
+      echo '# HELP vps_psiphon_last_check_timestamp_seconds Time of the last watchdog check.'
+      echo '# TYPE vps_psiphon_last_check_timestamp_seconds gauge'
+      echo "vps_psiphon_last_check_timestamp_seconds $(date +%s)"
+    } > "$mf" && chmod 644 "$mf" && mv -f "$mf" "$METRICS_DIR/vps-psiphon.prom" || rm -f "$mf"
+  }
+fi
 WD
 chmod 755 /usr/local/sbin/vps-psiphon-watchdog
 touch /var/log/vps-psiphon-watchdog.log
+# The watchdog appends a few lines every ten minutes, forever. copytruncate because it
+# opens the file per line and holds nothing to signal.
+if [ -d /etc/logrotate.d ]; then
+  cat > /etc/logrotate.d/vps-psiphon <<'LR'
+/var/log/vps-psiphon-watchdog.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+LR
+fi
 
 # ---- management CLI ---------------------------------------------------------
 cat > /usr/local/sbin/vps-psiphon <<'CLI'
@@ -856,6 +1032,23 @@ cc_list() {
        | tr '[:lower:]' '[:upper:]')"
   [ -z "$s" ] || printf '%s\n' "$s" | grep -qxE '[A-Z]{2}( [A-Z]{2})*' || return 1
   printf '%s' "$s"
+}
+
+# The watchdog's lock. Commands that restart the tunnel or rewrite the env file wait
+# for a running check to finish — it can take a few minutes when it is rotating — and
+# a check that starts meanwhile skips itself.
+take_lock() {
+  exec 9>/run/vps-psiphon.lock
+  flock -w 300 9 || { echo "a watchdog check is still running after 5 minutes — try again" >&2; exit 1; }
+}
+
+# Same sender as the watchdog's: direct, token kept out of argv.
+notify() {
+  [ -n "${TG_TOKEN:-}" ] && [ -n "${TG_CHAT:-}" ] || return 1
+  printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$TG_TOKEN" \
+    | curl -s -o /dev/null -w '%{http_code}' --max-time 10 -K - \
+        --data-urlencode "chat_id=${TG_CHAT}" \
+        --data-urlencode "text=vps-psiphon @ $(hostname): $*" 2>/dev/null
 }
 
 status() {
@@ -912,6 +1105,7 @@ status() {
 case "${1:-status}" in
   status) status ;;
   rotate)
+    take_lock
     echo "rotating (fresh tunnel, new exit)…"
     moved="$(/usr/local/sbin/vps-psiphon-advance-region 2>/dev/null)"
     [ -n "$moved" ] && echo "region    : $moved"
@@ -925,6 +1119,7 @@ case "${1:-status}" in
     # MISSING argument, not an empty one.
     [ $# -ge 2 ] || { echo "usage: vps-psiphon pool '<CC CC …>'   (empty string clears it)"; exit 1; }
     np="$(cc_list "$2")" || { echo "pool: '$2' is not a list of two-letter country codes" >&2; exit 1; }
+    take_lock
     grep -q '^REGION_POOL=' /etc/default/vps-psiphon \
       || { echo "pool: no REGION_POOL line in /etc/default/vps-psiphon — re-run the installer" >&2; exit 1; }
     sed -i "s/^REGION_POOL=.*/REGION_POOL='$np'/" /etc/default/vps-psiphon
@@ -947,6 +1142,7 @@ case "${1:-status}" in
       *) na="$(cc_list "$2")" \
            || { echo "accept: '$2' is neither 'any' nor a list of two-letter country codes" >&2; exit 1; } ;;
     esac
+    take_lock
     grep -q '^ACCEPT_REGIONS=' /etc/default/vps-psiphon \
       || { echo "accept: no ACCEPT_REGIONS line in /etc/default/vps-psiphon — re-run the installer" >&2; exit 1; }
     sed -i "s/^ACCEPT_REGIONS=.*/ACCEPT_REGIONS='$na'/" /etc/default/vps-psiphon
@@ -966,6 +1162,7 @@ case "${1:-status}" in
       *) r="$(cc_list "$2")" && [ -n "$r" ] && [ "$r" = "${r%% *}" ] \
            || { echo "region: '$2' is neither 'auto' nor one two-letter country code" >&2; exit 1; } ;;
     esac
+    take_lock
     sed -i "s/^EGRESS_REGION=.*/EGRESS_REGION=$r/" /etc/default/vps-psiphon
     EGRESS_REGION="$r"   # the file was sourced at startup; keep status() honest
     # The image seeds /config on first run only; an existing psiphon.config keeps the
@@ -980,11 +1177,66 @@ case "${1:-status}" in
     # mktemp, not a fixed name: this runs as root, and a predictable path in /tmp is
     # one anybody on the host can pre-plant as a symlink.
     tf="$(mktemp)"; t0=$(date +%s.%N)
-    for i in 1 2 3 4; do curl -s -o /dev/null --max-time 300 "${S[@]}" -w '%{size_download}\n' "$U" >> "$tf" & done
+    for _ in 1 2 3 4; do curl -s -o /dev/null --max-time 300 "${S[@]}" -w '%{size_download}\n' "$U" >> "$tf" & done
     wait; t1=$(date +%s.%N)
     awk -v a="$t0" -v b="$t1" '{s+=$1} END{printf "%.1f Mbit/s aggregate\n", s*8/(b-a)/1e6}' "$tf"
     rm -f "$tf" ;;
   logs)     docker logs --tail "${2:-50}" "$NAME" ;;
+  notify-test)
+    if [ -z "${TG_TOKEN:-}" ] || [ -z "${TG_CHAT:-}" ]; then
+      echo "Telegram alerts are off: set them with the installer's --tg-token and --tg-chat" >&2
+      exit 1
+    fi
+    code="$(notify "test message — alerts from this node reach this chat")"
+    if [ "$code" = 200 ]; then echo "sent"
+    else echo "not sent (HTTP ${code:-no answer}) — check the token, the chat id, and that the bot is in the chat" >&2; exit 1
+    fi ;;
+  update-image)
+    # The image is pinned by digest, which is what keeps it from changing under you —
+    # and also what keeps it from ever picking up a fix. This moves the pin on, in the
+    # open: it pulls the tag, shows old and new digest, and only then switches.
+    check=0; ref=""
+    for a in "${@:2}"; do
+      case "$a" in --check) check=1 ;; -*) echo "update-image: unknown option $a" >&2; exit 1 ;; *) ref="$a" ;; esac
+    done
+    if [ -z "$ref" ]; then
+      ref="${IMAGE%@*}"
+      # A tag lives after the last '/', so a registry port (host:5000/x) is not taken for one.
+      case "${ref##*/}" in *:*) ref="${ref%:*}" ;; esac
+      ref="$ref:latest"
+    fi
+    printf '%s\n' "$ref" | grep -qxE '[A-Za-z0-9._/:@-]+' || { echo "update-image: '$ref' is not an image reference" >&2; exit 1; }
+    repo="${ref%@*}"; case "${repo##*/}" in *:*) repo="${repo%:*}" ;; esac
+    [ "$check" = 1 ] || take_lock
+    # Read before the pull: when IMAGE is itself a tag, the pull moves it, and the
+    # "current" digest read afterwards would already be the new one.
+    case "$IMAGE" in
+      *@sha256:*) cur="${IMAGE#*@}" ;;
+      *) cur="$(docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGE" 2>/dev/null \
+                | head -1)"; cur="${cur#*@}" ;;
+    esac
+    echo "pulling   : $ref"
+    docker pull -q "$ref" >/dev/null || { echo "update-image: pull failed" >&2; exit 1; }
+    new="$(docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$ref" 2>/dev/null \
+           | grep -F "$repo@" | head -1)"
+    [ -n "$new" ] || { echo "update-image: $ref has no registry digest" >&2; exit 1; }
+    echo "current   : $IMAGE"
+    if [ "${new#*@}" = "$cur" ]; then
+      echo "up to date: $new"; exit 0
+    fi
+    echo "available : $new"
+    [ "$check" = 1 ] && exit 0
+    old="$IMAGE"
+    sed -i "s|^IMAGE=.*|IMAGE=$new|" /etc/default/vps-psiphon
+    IMAGE="$new"
+    echo "switching — the tunnel restarts, live connections drop"
+    systemctl restart vps-psiphon.service; sleep 45
+    # Only a digest reference is removed: a tag may by now name the image just
+    # switched to. Refused while anything still references it, which is fine.
+    case "$old" in
+      *@sha256:*) docker image rm "$old" >/dev/null 2>&1 && echo "removed   : $old" ;;
+    esac
+    status ;;
   routing)
     cat <<R
 Paste into the panel's config profile (Remnawave: Config Profiles -> your profile).
@@ -1088,7 +1340,9 @@ EOF
     rm -f /usr/local/sbin/vps-psiphon-run /usr/local/sbin/vps-psiphon-watchdog \
           /usr/local/sbin/vps-psiphon-advance-region \
           /etc/default/vps-psiphon /var/lib/vps-psiphon-watchdog.state \
-          /var/log/vps-psiphon-watchdog.log /tmp/vpspsi.speed
+          /var/log/vps-psiphon-watchdog.log /tmp/vpspsi.speed \
+          /etc/logrotate.d/vps-psiphon /run/vps-psiphon.lock
+    [ -n "${METRICS_DIR:-}" ] && rm -f "$METRICS_DIR/vps-psiphon.prom"
     rm -rf /opt/vps-psiphon
     # Safe to unlink while running: bash holds the inode open, so the rest of this
     # branch keeps executing after the name is gone.
@@ -1102,7 +1356,8 @@ EOF
              /etc/systemd/system/vps-psiphon-watchdog.service \
              /etc/systemd/system/vps-psiphon-watchdog.timer \
              /var/lib/vps-psiphon-watchdog.state \
-             /var/log/vps-psiphon-watchdog.log /opt/vps-psiphon ; do
+             /var/log/vps-psiphon-watchdog.log /etc/logrotate.d/vps-psiphon \
+             /opt/vps-psiphon ${METRICS_DIR:+"$METRICS_DIR/vps-psiphon.prom"} ; do
       [ -e "$p" ] && left="$left $p"
     done
     docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$NAME" && left="$left container:$NAME"
@@ -1110,7 +1365,7 @@ EOF
       && echo "note: image $IMAGE kept, something else on this host references it"
     [ -n "$left" ] && { echo "removed, but these remain:$left" >&2; exit 1; }
     echo "removed: units, container, image, config, state, log — and this CLI itself" ;;
-  *) echo "usage: vps-psiphon {status|verify|routing|rotate|region <CC|auto>|pool '<CC CC …>'|accept '<CC CC …>|any'|speed|logs [n]|watchdog [n]|uninstall}" ;;
+  *) echo "usage: vps-psiphon {status|verify|routing|rotate|region <CC|auto>|pool '<CC CC …>'|accept '<CC CC …>|any'|update-image [--check] [REF]|notify-test|speed|logs [n]|watchdog [n]|uninstall}" ;;
 esac
 CLI
 # IMAGE is validated to [A-Za-z0-9._/:@-], so it cannot break out of the | delimiter.
@@ -1176,7 +1431,7 @@ say "waiting for the tunnel"
 # success-shaped exit 0. systemd reports an auto-restarting unit as "activating", so
 # anything but "active" here is the failure, caught in ~3 s.
 TUNNEL_UP=0
-for i in $(seq 1 60); do
+for _ in $(seq 1 60); do
   systemctl is-active --quiet vps-psiphon.service || break
   docker logs "$NAME" 2>&1 | grep -q '"noticeType":"Tunnels"' && { TUNNEL_UP=1; break; }
   sleep 2
@@ -1212,4 +1467,4 @@ if [ "${BIND_CHANGED:-0}" = 1 ]; then
   printf '\033[1;33m    !! this run MOVED the address (%s -> %s), so the outbound above is\n' "$OLD_BIND" "$BIND"
   printf '       NOT what your panel has. Update it now, or the tunnel carries nothing.\033[0m\n'
 fi
-say "manage with:  vps-psiphon {status|verify|routing|rotate|region <CC>|pool '<CC CC …>'|accept '<CC CC …>'|speed|logs|uninstall}"
+say "manage with:  vps-psiphon {status|verify|routing|rotate|region <CC>|pool '<CC CC …>'|accept '<CC CC …>'|update-image|notify-test|speed|logs|uninstall}"
