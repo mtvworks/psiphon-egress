@@ -101,7 +101,7 @@ vps-psiphon rotate                  new tunnel, new exit, advances the pool
 vps-psiphon region DE               pin one country
 vps-psiphon pool 'DE NL FR'         set the rotation pool
 vps-psiphon accept 'DE NL'          which verdicts are acceptable
-vps-psiphon update-image [--check]  move the pinned digest to the current :latest
+vps-psiphon update-image [--check]  move the pinned digest to the followed tag's build
 vps-psiphon notify-test             send a test Telegram alert
 vps-psiphon speed                   throughput through the tunnel
 vps-psiphon logs / watchdog         container log / watchdog journal
@@ -114,10 +114,20 @@ watchdog, so a manual command never lands in the middle of a check.
 ## Keeping the image current
 
 The image is pinned by digest so it cannot change under you — which also means it
-never picks up a fix on its own. `vps-psiphon update-image --check` pulls the tag
-and shows whether the digest moved; without `--check` it switches to the new
-digest, restarts the tunnel (live connections drop) and removes the old image.
-A reinstall keeps the digest you moved to.
+never picks up a fix on its own. `IMAGE` is stored as `repo:tag@sha256:…`: the
+digest is what runs, the tag is what updates follow. The default follows
+`:latest`; a node installed with `--image repo:v2` keeps following `:v2`.
+
+- `vps-psiphon update-image --check` pulls the followed tag and shows whether the
+  digest moved; nothing changes.
+- `vps-psiphon update-image` switches to the new digest, restarts the tunnel (live
+  connections drop) and removes the old image.
+- `vps-psiphon update-image repo:v3` switches **and makes `:v3` the followed tag**
+  from then on. A bare digest (`repo@sha256:…`) pins that build and keeps the
+  current tag.
+
+A reinstall keeps the pinned digest and the followed tag. `--image repo@sha256:…`
+(no tag) on a reinstall keeps the tag followed so far.
 
 ## Alerts and metrics
 
