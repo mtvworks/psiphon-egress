@@ -5,10 +5,9 @@
 REPO="$(cd "$(dirname "${BATS_TEST_FILENAME}")/.." && pwd)"
 INSTALLER="$REPO/psiphon_install.sh"
 
-# Body of the heredoc `cat > … <<'TAG'` … `TAG`.
-heredoc() {
-  awk -v t="$1" '$0 ~ "<<\x27"t"\x27$" {f=1; next} $0==t {f=0} f' "$INSTALLER"
-}
+# A generated script as the installer writes it: the heredoc body, shared functions
+# substituted in (see tests/render.sh).
+heredoc() { bash "$REPO/tests/render.sh" "$1"; }
 
 # A top-level function of the installer, `name() {` through the first `}` at column 0.
 installer_fn() {
@@ -114,7 +113,13 @@ case "$1" in
   pull)    echo "docker pull ${*: -1}" >> "$STUB_LOG" ;;
   image)
     case "$2" in
-      inspect) printf '%s\n' "${FAKE_DIGESTS:-}" ;;
+      inspect)
+        # {{.Id}} lookups answer from FAKE_IDS ("ref=id" lines) when it is set.
+        if [ -n "${FAKE_IDS:-}" ] && [[ "$*" == *'{{.Id}}'* ]]; then
+          printf '%s\n' "$FAKE_IDS" | sed -n "s|^${*: -1}=||p"
+        else
+          printf '%s\n' "${FAKE_DIGESTS:-}"
+        fi ;;
       rm)      echo "docker image rm ${*: -1}" >> "$STUB_LOG" ;;
     esac ;;
 esac

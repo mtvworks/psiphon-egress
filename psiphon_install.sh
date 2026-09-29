@@ -33,7 +33,7 @@ set -euo pipefail
 # and nothing announces it. A digest is reproducible — `--image ref:tag` still
 # accepts a moving tag for anyone who wants one, with a warning.
 IMAGE_DEFAULT_DIGEST="sha256:26bb31230f2c99defcb4f1e3d912037aeba0971333a17eb55b37f3e5bf7f69c0"
-IMAGE_DEFAULT="swarupsengupta2007/psiphon@$IMAGE_DEFAULT_DIGEST"
+IMAGE_DEFAULT="swarupsengupta2007/psiphon:latest@$IMAGE_DEFAULT_DIGEST"
 # Asked for (flag or environment) or not: an image moved on by `vps-psiphon
 # update-image` must survive a reinstall, not be rolled back to the digest shipped here.
 IMAGE_SET=0; [ -n "${IMAGE:-}" ] && IMAGE_SET=1
@@ -100,6 +100,32 @@ cc_list() {
        | tr '[:lower:]' '[:upper:]')"
   [ -z "$s" ] || printf '%s\n' "$s" | grep -qxE '[A-Z]{2}( [A-Z]{2})*' || return 1
   printf '%s' "$s"
+}
+
+# Image references are kept as repo:tag@sha256:… — the digest is what runs, the tag is
+# what `update-image` follows, so a node installed from :v2 keeps getting v2 and never
+# drifts to whatever :latest has become. A tag lives after the last '/', so a registry
+# port (host:5000/x) is never taken for one. A reference with no tag follows :latest.
+img_repo()   { local r="${1%@*}"; case "${r##*/}" in *:*) r="${r%:*}" ;; esac; printf '%s' "$r"; }
+img_tag()    { local r="${1%@*}"; case "${r##*/}" in *:*) printf '%s' "${r##*:}" ;; *) printf latest ;; esac; }
+img_tagged() { local r="${1%@*}"; case "${r##*/}" in *:*) return 0 ;; esac; return 1; }
+img_digest() { case "$1" in *@*) printf '%s' "${1#*@}" ;; esac; }
+# What docker inspects or removes: repo@digest when pinned, the reference as given
+# otherwise. The tag is bookkeeping and is kept out of those lookups.
+img_canon()  {
+  local d; d="$(img_digest "$1")"
+  if [ -n "$d" ]; then printf '%s@%s' "$(img_repo "$1")" "$d"; else printf '%s' "$1"; fi
+}
+
+# The generated launcher and CLI need these too. They get these exact definitions,
+# written in where @@SHARED_FUNCS@@ stands, rather than a hand-kept second copy that
+# could drift: the reinstall path and update-image must parse IMAGE the same way.
+# Through ENVIRON, not awk -v, which would expand the \n inside cc_list.
+SHARED_FUNCS="$(declare -f cc_list img_repo img_tag img_tagged img_digest img_canon)"
+put_shared_funcs() {
+  local f="$1" t; t="$(mktemp "$f.XXXXXX")"
+  SHARED_FUNCS="$SHARED_FUNCS" awk '$0 == "@@SHARED_FUNCS@@" { print ENVIRON["SHARED_FUNCS"]; next } { print }' \
+    "$f" > "$t" && mv -f "$t" "$f"
 }
 
 usage() {
@@ -254,6 +280,13 @@ command -v curl >/dev/null || die "curl is not installed"
 command -v ss >/dev/null || die "ss is not installed (package iproute2) — needed to check the ports"
 # The watchdog and the CLI's rotate/region/update-image serialise on one lock.
 command -v flock >/dev/null || die "flock is not installed (package util-linux)"
+# Taken before the old settings are read and held until this script exits. A watchdog
+# rotation running meanwhile would otherwise write its region step into the env file
+# and restart the unit under us — the old region comes back over the new one, and the
+# overlapping restart reads below as a tunnel that never started. The watchdog skips
+# while this is held, the CLI waits.
+exec 9>/run/vps-psiphon.lock
+flock -w 300 9 || die "a watchdog check or vps-psiphon command has held the lock for 5 minutes — try again"
 
 # ------------------------------------------------------------- bind address --
 # Where the SOCKS5 is published decides whether the kernel can carry it. Docker
@@ -370,10 +403,25 @@ if [ -r "$ENVF" ]; then
   stored() { sed -n "s/^$1=//p" "$ENVF" | head -1 | tr -d "'"; }
   if [ "$IMAGE_SET" = 0 ]; then
     V="$(stored IMAGE)"
-    if [ -n "$V" ] && [ "$V" != "$IMAGE" ]; then
+    # Compared by what runs, not by spelling: an older install stored the same build
+    # as repo@digest without the tag.
+    if [ -n "$V" ] && [ "$(img_canon "$V")" != "$(img_canon "$IMAGE")" ]; then
       say "keeping image $V from the previous install (this script's default: $IMAGE)"
       say "    move it with 'vps-psiphon update-image', or re-run with --image"
+    fi
+    # Rewritten as repo:tag@digest, so an env from before the tag was recorded
+    # comes out in the documented form (a bare repo@digest follows :latest).
+    if [ -n "$V" ] && [ -n "$(img_digest "$V")" ]; then
+      IMAGE="$(img_repo "$V"):$(img_tag "$V")@$(img_digest "$V")"
+    elif [ -n "$V" ]; then
       IMAGE="$V"
+    fi
+  elif [ -n "$(img_digest "$IMAGE")" ] && ! img_tagged "$IMAGE"; then
+    # --image repo@sha256:… pins a build without naming a tag: the tag this node
+    # followed so far carries on, exactly as `update-image repo@sha256:…` does.
+    V="$(stored IMAGE)"
+    if [ -n "$V" ] && [ "$(img_repo "$V")" = "$(img_repo "$IMAGE")" ]; then
+      IMAGE="$(img_repo "$IMAGE"):$(img_tag "$V")@$(img_digest "$IMAGE")"
     fi
   fi
   [ "$TG_TOKEN_SET" = 1 ]    || TG_TOKEN="$(stored TG_TOKEN)"
@@ -542,6 +590,7 @@ fi
 chmod 600 "$ENVF"
 cat > "$ENVF" <<EOF
 # vps-psiphon — written by psiphon_install.sh
+# repo:tag@digest — the digest runs, the tag is what \`vps-psiphon update-image\` follows.
 IMAGE=$IMAGE
 NAME=$NAME
 MEM_LIMIT=$MEM_LIMIT
@@ -634,8 +683,8 @@ case "$IMAGE" in
      printf '     under you on any pull, silently. Pin it with --image name@sha256:…\033[0m\n' ;;
 esac
 say "pulling image"
-docker pull -q "$IMAGE" >/dev/null
-docker image inspect -f '{{index .RepoDigests 0}}' "$IMAGE" 2>/dev/null \
+docker pull -q "$(img_canon "$IMAGE")" >/dev/null
+docker image inspect -f '{{index .RepoDigests 0}}' "$(img_canon "$IMAGE")" 2>/dev/null \
   | sed 's/^/    deployed digest: /' || true
 
 # ---- launcher ---------------------------------------------------------------
@@ -644,6 +693,7 @@ cat > /usr/local/sbin/vps-psiphon-run <<'RUN'
 # Foreground container launcher; systemd owns the lifecycle.
 set -euo pipefail
 . /etc/default/vps-psiphon
+@@SHARED_FUNCS@@
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 # NOTE: the BIND prefix is load-bearing. Publishing without it exposes an OPEN SOCKS5
 # PROXY to the internet — psiphon binds 0.0.0.0 inside the container. Both addresses
@@ -662,8 +712,9 @@ exec docker run --rm --name "$NAME" \
   -e SOCKS_PORT="$SOCKS_PORT" -e HTTP_PORT="$HTTP_PORT" \
   -e DEVICE_REGION="$DEVICE_REGION" -e EGRESS_REGION="$EGRESS_REGION" \
   -v "${CONF_DIR}:/config" \
-  "$IMAGE"
+  "$(img_canon "$IMAGE")"
 RUN
+put_shared_funcs /usr/local/sbin/vps-psiphon-run
 chmod 755 /usr/local/sbin/vps-psiphon-run
 
 # ---- region pool ------------------------------------------------------------
@@ -745,7 +796,7 @@ log() { printf '%s %s\n' "$(date -Is)" "$*" >> "$LOG"; }
 # lock taken is skipped, not queued — the next timer tick is ten minutes away.
 exec 9>/run/vps-psiphon.lock
 if ! flock -n 9; then
-  log "skipped: a rotate, region change or image update is in progress"
+  log "skipped: another vps-psiphon operation (installer or a manual command) holds the lock"
   exit 0
 fi
 
@@ -1024,22 +1075,33 @@ accepted_regions() {
   printf '%s' "$acc"
 }
 
-# Same normalisation as the installer: the result is written into a file root
-# sources, and GL is always upper case.
-cc_list() {
-  local s
-  s="$(printf '%s' "$1" | tr ',' ' ' | tr -s ' ' | sed 's/^ //; s/ $//' \
-       | tr '[:lower:]' '[:upper:]')"
-  [ -z "$s" ] || printf '%s\n' "$s" | grep -qxE '[A-Z]{2}( [A-Z]{2})*' || return 1
-  printf '%s' "$s"
+# cc_list and the img_* helpers: the installer's own definitions, put here at
+# install time (see SHARED_FUNCS in psiphon_install.sh) — one copy, not two.
+@@SHARED_FUNCS@@
+
+# Removes a pinned image: its digest, and its tag while that tag still names this very
+# image. update-image pulls by tag, which leaves the tag on the build, so removing the
+# digest alone would only untag it and keep it on disk; a tag that has since moved to
+# another build belongs to that build and is left alone. Docker refuses either while
+# something still uses the image, which is fine.
+rm_image() {
+  local c t cid
+  c="$(img_canon "$1")"; t="$(img_repo "$1"):$(img_tag "$1")"
+  cid="$(docker image inspect -f '{{.Id}}' "$c" 2>/dev/null)" || return 1
+  [ -n "$cid" ] || return 1
+  if [ "$(docker image inspect -f '{{.Id}}' "$t" 2>/dev/null)" = "$cid" ]; then
+    docker image rm "$t" >/dev/null 2>&1
+  fi
+  docker image rm "$c" >/dev/null 2>&1
 }
 
-# The watchdog's lock. Commands that restart the tunnel or rewrite the env file wait
-# for a running check to finish — it can take a few minutes when it is rotating — and
-# a check that starts meanwhile skips itself.
+# The lock shared with the watchdog and the installer. Commands that restart the tunnel
+# or rewrite the env file wait for whichever holds it — a check can take a few minutes
+# when it rotates, a reinstall longer — and a watchdog check that starts meanwhile
+# skips itself.
 take_lock() {
   exec 9>/run/vps-psiphon.lock
-  flock -w 300 9 || { echo "a watchdog check is still running after 5 minutes — try again" >&2; exit 1; }
+  flock -w 300 9 || { echo "another vps-psiphon operation (installer, watchdog check or command) has held the lock for 5 minutes — try again" >&2; exit 1; }
 }
 
 # Same sender as the watchdog's: direct, token kept out of argv.
@@ -1194,34 +1256,49 @@ case "${1:-status}" in
   update-image)
     # The image is pinned by digest, which is what keeps it from changing under you —
     # and also what keeps it from ever picking up a fix. This moves the pin on, in the
-    # open: it pulls the tag, shows old and new digest, and only then switches.
+    # open: it pulls the followed tag, shows old and new digest, and only then switches.
     check=0; ref=""
     for a in "${@:2}"; do
       case "$a" in --check) check=1 ;; -*) echo "update-image: unknown option $a" >&2; exit 1 ;; *) ref="$a" ;; esac
     done
-    if [ -z "$ref" ]; then
-      ref="${IMAGE%@*}"
-      # A tag lives after the last '/', so a registry port (host:5000/x) is not taken for one.
-      case "${ref##*/}" in *:*) ref="${ref%:*}" ;; esac
-      ref="$ref:latest"
-    fi
+    # No reference: the tag recorded in IMAGE. A reference that names a tag makes that
+    # tag the one followed from now on; one without (a bare repo or a digest) keeps the
+    # current tag when it is the same repository, :latest otherwise.
+    [ -n "$ref" ] || ref="$(img_repo "$IMAGE"):$(img_tag "$IMAGE")"
     printf '%s\n' "$ref" | grep -qxE '[A-Za-z0-9._/:@-]+' || { echo "update-image: '$ref' is not an image reference" >&2; exit 1; }
-    repo="${ref%@*}"; case "${repo##*/}" in *:*) repo="${repo%:*}" ;; esac
+    repo="$(img_repo "$ref")"
+    if img_tagged "$ref"; then tag="$(img_tag "$ref")"
+    elif [ "$repo" = "$(img_repo "$IMAGE")" ]; then tag="$(img_tag "$IMAGE")"
+    else tag=latest; fi
     [ "$check" = 1 ] || take_lock
-    # Read before the pull: when IMAGE is itself a tag, the pull moves it, and the
+    # Read before the pull: when IMAGE is an unpinned tag, the pull moves it, and the
     # "current" digest read afterwards would already be the new one.
-    case "$IMAGE" in
-      *@sha256:*) cur="${IMAGE#*@}" ;;
-      *) cur="$(docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGE" 2>/dev/null \
-                | head -1)"; cur="${cur#*@}" ;;
-    esac
-    echo "pulling   : $ref"
-    docker pull -q "$ref" >/dev/null || { echo "update-image: pull failed" >&2; exit 1; }
-    new="$(docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$ref" 2>/dev/null \
+    cur="$(img_digest "$IMAGE")"
+    if [ -z "$cur" ]; then
+      cur="$(docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGE" 2>/dev/null | head -1)"
+      cur="${cur#*@}"
+    fi
+    # What is pulled is what gets recorded: a pinned digest as such, otherwise the tag
+    # the new pin will follow — never a bare repo, which docker reads as :latest.
+    if [ -n "$(img_digest "$ref")" ]; then pull="$(img_canon "$ref")"; else pull="$repo:$tag"; fi
+    echo "pulling   : $pull"
+    docker pull -q "$pull" >/dev/null || { echo "update-image: pull failed" >&2; exit 1; }
+    d="$(img_digest "$ref")"
+    if [ -z "$d" ]; then
+      d="$(docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$pull" 2>/dev/null \
            | grep -F "$repo@" | head -1)"
-    [ -n "$new" ] || { echo "update-image: $ref has no registry digest" >&2; exit 1; }
+      d="${d#*@}"
+    fi
+    [ -n "$d" ] || { echo "update-image: $ref has no registry digest" >&2; exit 1; }
+    new="$repo:$tag@$d"
     echo "current   : $IMAGE"
-    if [ "${new#*@}" = "$cur" ]; then
+    if [ "$d" = "$cur" ]; then
+      # Same build; only the followed tag may have changed, which needs no restart.
+      if [ "$check" = 0 ] && [ "$new" != "$IMAGE" ]; then
+        sed -i "s|^IMAGE=.*|IMAGE=$new|" /etc/default/vps-psiphon
+        [ "$(img_repo "$IMAGE"):$(img_tag "$IMAGE")" = "$repo:$tag" ] \
+          || echo "following : $repo:$tag from now on"
+      fi
       echo "up to date: $new"; exit 0
     fi
     echo "available : $new"
@@ -1229,13 +1306,12 @@ case "${1:-status}" in
     old="$IMAGE"
     sed -i "s|^IMAGE=.*|IMAGE=$new|" /etc/default/vps-psiphon
     IMAGE="$new"
+    [ "$(img_repo "$old"):$(img_tag "$old")" = "$repo:$tag" ] || echo "following : $repo:$tag from now on"
     echo "switching — the tunnel restarts, live connections drop"
     systemctl restart vps-psiphon.service; sleep 45
-    # Only a digest reference is removed: a tag may by now name the image just
-    # switched to. Refused while anything still references it, which is fine.
-    case "$old" in
-      *@sha256:*) docker image rm "$old" >/dev/null 2>&1 && echo "removed   : $old" ;;
-    esac
+    # Only a pinned reference is removed: an unpinned tag may by now name the image
+    # just switched to.
+    [ -n "$(img_digest "$old")" ] && rm_image "$old" && echo "removed   : $(img_canon "$old")"
     status ;;
   routing)
     cat <<R
@@ -1326,6 +1402,11 @@ EOF
     exit $rc ;;
   watchdog) tail -n "${2:-30}" /var/log/vps-psiphon-watchdog.log ;;
   uninstall)
+    # Held to the end so a running check or rotation finishes first, instead of
+    # restarting a unit this is removing. The lock file itself stays: unlinking it
+    # would let the next command lock a fresh file while an old holder still runs.
+    # It lives in /run and is gone at the next boot.
+    take_lock
     systemctl disable --now vps-psiphon-watchdog.timer vps-psiphon-watchdog.service \
                             vps-psiphon.service >/dev/null 2>&1
     docker rm -f "$NAME" >/dev/null 2>&1
@@ -1336,12 +1417,12 @@ EOF
     systemctl reset-failed vps-psiphon.service vps-psiphon-watchdog.service >/dev/null 2>&1
     # Ours to drop: the installer pulled it and a reinstall pulls it again. Docker
     # refuses while anything else references it, which is fine.
-    docker image rm "$IMAGE" >/dev/null 2>&1
+    rm_image "$IMAGE"
     rm -f /usr/local/sbin/vps-psiphon-run /usr/local/sbin/vps-psiphon-watchdog \
           /usr/local/sbin/vps-psiphon-advance-region \
           /etc/default/vps-psiphon /var/lib/vps-psiphon-watchdog.state \
           /var/log/vps-psiphon-watchdog.log /tmp/vpspsi.speed \
-          /etc/logrotate.d/vps-psiphon /run/vps-psiphon.lock
+          /etc/logrotate.d/vps-psiphon
     [ -n "${METRICS_DIR:-}" ] && rm -f "$METRICS_DIR/vps-psiphon.prom"
     rm -rf /opt/vps-psiphon
     # Safe to unlink while running: bash holds the inode open, so the rest of this
@@ -1361,8 +1442,8 @@ EOF
       [ -e "$p" ] && left="$left $p"
     done
     docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$NAME" && left="$left container:$NAME"
-    docker image inspect "$IMAGE" >/dev/null 2>&1 \
-      && echo "note: image $IMAGE kept, something else on this host references it"
+    docker image inspect "$(img_canon "$IMAGE")" >/dev/null 2>&1 \
+      && echo "note: image $(img_canon "$IMAGE") kept, something else on this host references it"
     [ -n "$left" ] && { echo "removed, but these remain:$left" >&2; exit 1; }
     echo "removed: units, container, image, config, state, log — and this CLI itself" ;;
   *) echo "usage: vps-psiphon {status|verify|routing|rotate|region <CC|auto>|pool '<CC CC …>'|accept '<CC CC …>|any'|update-image [--check] [REF]|notify-test|speed|logs [n]|watchdog [n]|uninstall}" ;;
@@ -1370,6 +1451,7 @@ esac
 CLI
 # IMAGE is validated to [A-Za-z0-9._/:@-], so it cannot break out of the | delimiter.
 sed -i "s|@@IMAGE@@|$IMAGE|" /usr/local/sbin/vps-psiphon
+put_shared_funcs /usr/local/sbin/vps-psiphon
 chmod 755 /usr/local/sbin/vps-psiphon
 
 # ---- units ------------------------------------------------------------------
