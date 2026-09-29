@@ -75,6 +75,22 @@ SOCKS_PORT_SET=0
 HTTP_PORT_SET=0
 PUBLISH_HTTP_SET=0
 
+say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
+die() { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# Country lists arrive comma- or space-separated and in any case, and leave as
+# upper-case codes separated by single spaces. Anything else is refused rather than
+# carried: GL is always upper case, so a stray "de" never matches and the watchdog
+# rotates forever, and every value here ends up in a file that root sources and
+# edits with sed.
+cc_list() {
+  local s
+  s="$(printf '%s' "$1" | tr ',' ' ' | tr -s ' ' | sed 's/^ //; s/ $//' \
+       | tr '[:lower:]' '[:upper:]')"
+  [ -z "$s" ] || printf '%s\n' "$s" | grep -qxE '[A-Z]{2}( [A-Z]{2})*' || return 1
+  printf '%s' "$s"
+}
+
 usage() {
   cat <<'U'
 psiphon_install.sh [options]
@@ -84,9 +100,11 @@ psiphon_install.sh [options]
                        next country in it. That widens the server choice when one
                        country is congested, while keeping the exit inside a set
                        you chose — unlike auto, which may land on another
-                       continent and cost you the latency. Available at the time
-                       of writing: AT AU BE BR CA CH CZ DE DK ES FR GB ID IE IN
-                       IT JP NL NO PL RS SE SG US
+                       continent and cost you the latency. 'auto' = empty.
+                       Available at the time of writing: AT AU BE BR CA CH CZ
+                       DE DK ES FR GB ID IE IN IT JP LT NL NO PL RO RS SE SG US.
+                       Omitted on a reinstall, the stored region and pool are
+                       kept; --region '' switches back to auto.
   --device-region CC   region the client reports. Cosmetic — the server decides
                        by GeoIP. Default: autodetected from this host.
   --socks-port N       SOCKS5 port for xray, default 1080. Refused if
@@ -112,7 +130,7 @@ psiphon_install.sh [options]
                        exits to US regardless of where they are, and that costs
                        nothing. Pass 'any' to accept every country and leave
                        --deny-regions as the only country check.
-  --bind ADDR          host address to publish the SOCKS5 on. Default: the
+  --bind ADDR          host IPv4 address to publish the SOCKS5 on. Default: the
                        docker0 gateway (usually 172.17.0.1). Publishing there
                        lets the kernel DNAT the traffic; publishing on loopback
                        cannot, so every byte is copied through docker-proxy in
@@ -126,9 +144,10 @@ psiphon_install.sh [options]
                        reachable by containers on the default bridge — at the
                        price of that userspace copy. Neither address is
                        reachable from the internet.
-  --image REF          container image
+  --image REF          container image, default swarupsengupta2007/psiphon pinned
+                       by digest
   --memory SIZE        container memory ceiling (default 512m)
-  --pids-limit N       container pid ceiling (default 256), default swarupsengupta2007/psiphon:latest
+  --pids-limit N       container pid ceiling (default 256)
   --no-watchdog        skip the watchdog
 U
 }
@@ -137,7 +156,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --region)
       # One country as before; several form a pool the watchdog walks on rotation.
-      REGION_POOL="$(printf '%s' "${2:-}" | tr ',' ' ' | tr -s ' ' | sed 's/^ //; s/ $//')"
+      V="${2:-}"; case "$V" in [Aa][Uu][Tt][Oo]) V="" ;; esac
+      REGION_POOL="$(cc_list "$V")" || die "--region: '$V' is not a list of two-letter country codes"
       EGRESS_REGION="${REGION_POOL%% *}"
       [ "$REGION_POOL" = "$EGRESS_REGION" ] && REGION_POOL=""
       REGION_POOL_SET=1; shift 2 ;;
@@ -147,10 +167,15 @@ while [ $# -gt 0 ]; do
     --no-http)       PUBLISH_HTTP=0; PUBLISH_HTTP_SET=1; shift ;;
     --http)          PUBLISH_HTTP=1; PUBLISH_HTTP_SET=1; shift ;;
     --deny-regions)
-      DENY_REGIONS="$(printf '%s' "${2:-}" | tr ',' ' ' | tr -s ' ' | sed 's/^ //; s/ $//')"
+      DENY_REGIONS="$(cc_list "${2:-}")" \
+        || die "--deny-regions: '${2:-}' is not a list of two-letter country codes"
       DENY_REGIONS_SET=1; shift 2 ;;
     --accept)
-      ACCEPT_REGIONS="$(printf '%s' "${2:-}" | tr ',' ' ' | tr -s ' ' | sed 's/^ //; s/ $//')"
+      case "${2:-}" in
+        [Aa][Nn][Yy]) ACCEPT_REGIONS=any ;;
+        *) ACCEPT_REGIONS="$(cc_list "${2:-}")" \
+             || die "--accept: '${2:-}' is neither 'any' nor a list of two-letter country codes" ;;
+      esac
       ACCEPT_REGIONS_SET=1; shift 2 ;;
     --bind)          BIND="${2:?}";          shift 2 ;;
 
@@ -164,14 +189,38 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
-die() { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+# ------------------------------------------------------------------- inputs --
+# Checked before anything is written: every one of these lands in the env file that
+# root sources, and several are spliced into sed expressions or docker arguments.
+# EGRESS_REGION and DEVICE_REGION may also come from the environment, so they are
+# normalised here rather than only in the option parser.
+EGRESS_REGION="$(cc_list "$EGRESS_REGION")" && [ "$EGRESS_REGION" = "${EGRESS_REGION%% *}" ] \
+  || die "EGRESS_REGION: expected one two-letter country code"
+DEVICE_REGION="$(cc_list "$DEVICE_REGION")" && [ "$DEVICE_REGION" = "${DEVICE_REGION%% *}" ] \
+  || die "--device-region: expected one two-letter country code"
+is_port() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+is_port "$SOCKS_PORT" || die "--socks-port: '$SOCKS_PORT' is not a port number"
+is_port "$HTTP_PORT"  || die "--http-port: '$HTTP_PORT' is not a port number"
+# IPv4 only: the launcher publishes "$BIND:port:port" and the probes dial
+# "$BIND:port", neither of which is written to take an IPv6 literal.
+if [ -n "$BIND" ]; then
+  printf '%s\n' "$BIND" | grep -qxE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
+    && [ "$(printf '%s' "$BIND" | tr '.' '\n' | awk '$1 > 255' | wc -l)" = 0 ] \
+    || die "--bind: '$BIND' is not an IPv4 address"
+fi
+printf '%s\n' "$MEM_LIMIT"  | grep -qxE '[0-9]+[bkmgBKMG]?' || die "--memory: '$MEM_LIMIT' is not a size like 512m"
+printf '%s\n' "$PIDS_LIMIT" | grep -qxE '[0-9]+'            || die "--pids-limit: '$PIDS_LIMIT' is not a number"
+printf '%s\n' "$IMAGE"      | grep -qxE '[A-Za-z0-9._/:@-]+' || die "--image: '$IMAGE' is not an image reference"
+printf '%s\n' "$NAME"       | grep -qxE '[A-Za-z0-9][A-Za-z0-9_.-]*' || die "NAME: '$NAME' is not a container name"
 
 # ---------------------------------------------------------------- preflight --
 [ "$(id -u)" = 0 ] || die "run as root"
 command -v docker >/dev/null || die "docker is not installed"
 docker info >/dev/null 2>&1 || die "docker daemon is not running"
 command -v curl >/dev/null || die "curl is not installed"
+# Without ss every port reads as free, and a collision surfaces only as a unit that
+# loops on a bind error after the install has claimed success.
+command -v ss >/dev/null || die "ss is not installed (package iproute2) — needed to check the ports"
 
 # ------------------------------------------------------------- bind address --
 # Where the SOCKS5 is published decides whether the kernel can carry it. Docker
@@ -274,7 +323,19 @@ if [ -r "$ENVF" ]; then
   if [ "$PUBLISH_HTTP_SET" = 0 ]; then
     V="$(sed -n 's/^PUBLISH_HTTP=//p' "$ENVF" | head -1)"; [ -n "$V" ] && PUBLISH_HTTP="$V"
   fi
+  # The region too, or a reinstall with no --region quietly means auto: the country
+  # the operator pinned is dropped, and the change of region below wipes the cached
+  # config and server list with it. What is stored may be a later pool step than the
+  # one first asked for — that is where the tunnel is now, so it is kept. An explicit
+  # --region, '' included, wins; so does EGRESS_REGION from the environment.
+  if [ "$REGION_POOL_SET" = 0 ] && [ -z "$EGRESS_REGION" ]; then
+    V="$(sed -n 's/^EGRESS_REGION=//p' "$ENVF" | head -1)"
+    [ -n "$V" ] && EGRESS_REGION="$(cc_list "$V")" && [ "$EGRESS_REGION" = "${EGRESS_REGION%% *}" ] \
+      || EGRESS_REGION=""
+  fi
 fi
+is_port "$SOCKS_PORT" || die "SOCKS_PORT '$SOCKS_PORT' in $ENVF is not a port number"
+is_port "$HTTP_PORT"  || die "HTTP_PORT '$HTTP_PORT' in $ENVF is not a port number"
 
 # Re-running over an existing install must work. The listener on our port is
 # docker-proxy, never a process called "$NAME", so ask docker who owns it.
@@ -361,6 +422,7 @@ chown -R 1000:1000 "$CONF_DIR"
 # Preserve operator-set values across a reinstall.
 OLD_OK_REGIONS=""; OLD_MIN_THROUGHPUT=""; OLD_REGION_POOL=""
 OLD_FAIL_WINDOW=""; OLD_GRACE=""; OLD_ACCEPT_REGIONS=""
+OLD_FAIL_THRESHOLD=""; OLD_COOLDOWN=""
 # Tracked as set-or-not, not by value: a deliberately emptied deny-list is a choice
 # the next reinstall must not undo.
 OLD_DENY_SET=0; OLD_DENY_REGIONS=""
@@ -376,6 +438,8 @@ if [ -r "$ENVF" ]; then
   OLD_OK_REGIONS="$(sed -n 's/^OK_REGIONS=//p' "$ENVF")"
   OLD_MIN_THROUGHPUT="$(sed -n 's/^MIN_THROUGHPUT_KBPS=//p' "$ENVF")"
   OLD_FAIL_WINDOW="$(sed -n 's/^FAIL_WINDOW=//p' "$ENVF")"
+  OLD_FAIL_THRESHOLD="$(sed -n 's/^FAIL_THRESHOLD=//p' "$ENVF")"
+  OLD_COOLDOWN="$(sed -n 's/^ROTATE_COOLDOWN=//p' "$ENVF")"
   OLD_GRACE="$(sed -n 's/^THROUGHPUT_GRACE_SEC=//p' "$ENVF")"
   OLD_REGION_POOL="$(sed -n 's/^REGION_POOL=//p' "$ENVF" | tr -d "'")"
   # An explicit --region wins; otherwise an existing pool survives the reinstall.
@@ -436,9 +500,9 @@ CONF_DIR=$CONF_DIR
 # alternates around the floor instead of failing outright, and a counter that resets
 # on the first passing check never reaches the threshold. Seen on a live node — four
 # failures inside 70 minutes and no rotation.
-FAIL_THRESHOLD=2
+FAIL_THRESHOLD=${OLD_FAIL_THRESHOLD:-2}
 FAIL_WINDOW=${OLD_FAIL_WINDOW:-5}
-ROTATE_COOLDOWN=1800
+ROTATE_COOLDOWN=${OLD_COOLDOWN:-1800}
 #
 # NOTE: this file is sourced by the shell, so any value containing spaces MUST be
 # quoted. Unquoted, everything after the first space is run as a command.
@@ -626,13 +690,19 @@ else
   ytf="$(mktemp)"
   # The status code is read alongside the rate: the two failures below are told apart
   # by whether an HTTP transaction completed at all, not by how big it was.
+  # curl prints -w even when it gives up at --max-time, so a fallback must not be
+  # APPENDED to that output: "12345 200" followed by "0 000" reads back as status 000,
+  # and a transfer that had its response and ran out of time judged as a stall. Only an
+  # empty or malformed answer falls back.
   probe="$(LC_ALL=C curl -s --max-time 25 "${S[@]}" -H 'Accept-Language: en-US' \
-           -o "$ytf" -w '%{speed_download} %{http_code}' https://www.youtube.com/ 2>/dev/null || echo '0 000')"
-  spd="${probe%% *}"; ytcode="${probe##* }"
+           -o "$ytf" -w '%{speed_download} %{http_code}' https://www.youtube.com/ 2>/dev/null || true)"
+  spd="${probe%% *}"; spd="${spd%%.*}"; ytcode="${probe##* }"
+  case "$spd" in ''|*[!0-9]*) spd=0 ;; esac
+  case "$ytcode" in [0-9][0-9][0-9]) : ;; *) ytcode=000 ;; esac
   gl="$(grep -oE '"GL":"[A-Z]{2}"' "$ytf" 2>/dev/null | head -1 | cut -d'"' -f4)"
   got="$(stat -c %s "$ytf" 2>/dev/null || echo 0)"
   rm -f "$ytf"
-  kbps=$(( ${spd%%.*} / 1024 ))
+  kbps=$(( spd / 1024 ))
   if [ -n "$gl" ]; then
     # Deny runs first and in every mode: under auto with no OK_REGIONS the allow-list
     # below is empty by definition and judges nothing.
@@ -750,7 +820,9 @@ set -uo pipefail
 # hand-deleted file — `set -u` would abort on the first unset variable and leave the
 # CLI unable to clean up after itself.
 [ -r /etc/default/vps-psiphon ] && . /etc/default/vps-psiphon
-IMAGE="${IMAGE:-swarupsengupta2007/psiphon:latest}"
+# Filled in by the installer with the image it deployed, so an uninstall that has
+# lost the env file still removes that image and not an unrelated :latest.
+IMAGE="${IMAGE:-@@IMAGE@@}"
 NAME="${NAME:-vps-psiphon}"
 SOCKS_PORT="${SOCKS_PORT:-1080}"
 HTTP_PORT="${HTTP_PORT:-8080}"
@@ -776,8 +848,20 @@ accepted_regions() {
   printf '%s' "$acc"
 }
 
+# Same normalisation as the installer: the result is written into a file root
+# sources, and GL is always upper case.
+cc_list() {
+  local s
+  s="$(printf '%s' "$1" | tr ',' ' ' | tr -s ' ' | sed 's/^ //; s/ $//' \
+       | tr '[:lower:]' '[:upper:]')"
+  [ -z "$s" ] || printf '%s\n' "$s" | grep -qxE '[A-Z]{2}( [A-Z]{2})*' || return 1
+  printf '%s' "$s"
+}
+
 status() {
-  echo "container : $(docker ps --filter "name=^${NAME}$" --format '{{.Status}}' || echo 'DOWN')"
+  local v
+  v="$(docker ps --filter "name=^${NAME}$" --format '{{.Status}}' 2>/dev/null)"
+  echo "container : ${v:-DOWN}"
   echo "service   : $(systemctl is-active vps-psiphon.service) / $(systemctl is-enabled vps-psiphon.service 2>/dev/null)"
   echo "watchdog  : $(systemctl is-active vps-psiphon-watchdog.timer) / $(systemctl is-enabled vps-psiphon-watchdog.timer 2>/dev/null)"
   echo "socks     : ${BIND}:${SOCKS_PORT}   (region requested: ${EGRESS_REGION:-auto})"
@@ -790,17 +874,29 @@ status() {
   else
     echo "http      : not published"
   fi
-  echo -n "server    : "; docker logs "$NAME" 2>&1 | grep -o '"serverRegion":"[A-Z]*"' | tail -1 || echo '?'
-  echo -n "tunnels   : "; docker logs "$NAME" 2>&1 | grep -c '"noticeType":"Tunnels"' || echo 0
-  echo -n "limits    : "; docker logs "$NAME" 2>&1 | grep -o '"downstreamBytesPerSecond":[0-9]*' | tail -1 || echo 'n/a'
+  # A pipeline's fallback never fires here — tail succeeds on empty input, and
+  # grep -c prints its own 0 before failing — so the defaults are applied to the value.
+  v="$(docker logs "$NAME" 2>&1 | grep -o '"serverRegion":"[A-Z]*"' | tail -1)"
+  echo "server    : ${v:-?}"
+  v="$(docker logs "$NAME" 2>&1 | grep -c '"noticeType":"Tunnels"')"
+  echo "tunnels   : ${v:-0}"
+  v="$(docker logs "$NAME" 2>&1 | grep -o '"downstreamBytesPerSecond":[0-9]*' | tail -1)"
+  echo "limits    : ${v:-n/a}"
   echo -n "exit IP   : "; curl -s --max-time 20 "${S[@]}" https://api.ipify.org 2>/dev/null || echo 'UNREACHABLE'; echo
   local gl; gl="$(curl -s --max-time 25 "${S[@]}" -H 'Accept-Language: en-US' https://www.youtube.com/ 2>/dev/null \
                   | grep -oE '"GL":"[A-Z]{2}"' | head -1 | cut -d'"' -f4)"
-  ok=1
-  if [ -n "$gl" ] && [ -n "$acc" ] && [ "$acc" != any ]; then
+  # Deny first and in every mode, exactly as the watchdog does — with no pinned
+  # region and no OK_REGIONS it is the only check that would catch an RU exit.
+  denied=0; ok=1
+  if [ -n "$gl" ]; then
+    case " ${DENY_REGIONS:-} " in *" $gl "*) denied=1 ;; esac
+  fi
+  if [ "$denied" = 0 ] && [ -n "$gl" ] && [ -n "$acc" ] && [ "$acc" != any ]; then
     case " $acc " in *" $gl "*) ;; *) ok=0 ;; esac
   fi
-  if [ "$ok" = 0 ]; then
+  if [ "$denied" = 1 ]; then
+    echo "country   : ${gl} — DENIED (sanctioned or Google-blocked); the watchdog will rotate"
+  elif [ "$ok" = 0 ]; then
     echo "country   : ${gl} — NOT ACCEPTED (accepted: ${acc}); the watchdog will rotate"
   elif [ -n "${EGRESS_REGION:-}" ] && [ -n "$gl" ] && [ "$gl" != "$EGRESS_REGION" ]; then
     echo "country   : ${gl}   (asked ${EGRESS_REGION} — accepted; Google rewrites exits, and that alone is not a fault)"
@@ -828,7 +924,9 @@ case "${1:-status}" in
     # An empty string is valid here — it clears the pool — so this tests for a
     # MISSING argument, not an empty one.
     [ $# -ge 2 ] || { echo "usage: vps-psiphon pool '<CC CC …>'   (empty string clears it)"; exit 1; }
-    np="$(printf '%s' "$2" | tr ',' ' ' | tr -s ' ' | sed 's/^ //; s/ $//')"
+    np="$(cc_list "$2")" || { echo "pool: '$2' is not a list of two-letter country codes" >&2; exit 1; }
+    grep -q '^REGION_POOL=' /etc/default/vps-psiphon \
+      || { echo "pool: no REGION_POOL line in /etc/default/vps-psiphon — re-run the installer" >&2; exit 1; }
     sed -i "s/^REGION_POOL=.*/REGION_POOL='$np'/" /etc/default/vps-psiphon
     REGION_POOL="$np"
     if [ -n "$np" ]; then
@@ -844,7 +942,13 @@ case "${1:-status}" in
   accept)
     # An empty string is valid here too — it restores the computed default.
     [ $# -ge 2 ] || { echo "usage: vps-psiphon accept '<CC CC …>|any'   (empty string restores the default)"; exit 1; }
-    na="$(printf '%s' "$2" | tr ',' ' ' | tr -s ' ' | sed 's/^ //; s/ $//')"
+    case "$2" in
+      [Aa][Nn][Yy]) na=any ;;
+      *) na="$(cc_list "$2")" \
+           || { echo "accept: '$2' is neither 'any' nor a list of two-letter country codes" >&2; exit 1; } ;;
+    esac
+    grep -q '^ACCEPT_REGIONS=' /etc/default/vps-psiphon \
+      || { echo "accept: no ACCEPT_REGIONS line in /etc/default/vps-psiphon — re-run the installer" >&2; exit 1; }
     sed -i "s/^ACCEPT_REGIONS=.*/ACCEPT_REGIONS='$na'/" /etc/default/vps-psiphon
     ACCEPT_REGIONS="$na"
     if [ -n "$na" ]; then
@@ -857,7 +961,11 @@ case "${1:-status}" in
     fi ;;
   region)
     [ -n "${2:-}" ] || { echo "usage: vps-psiphon region <CC|auto>"; exit 1; }
-    r="$2"; [ "$r" = auto ] && r=""
+    case "$2" in
+      [Aa][Uu][Tt][Oo]) r="" ;;
+      *) r="$(cc_list "$2")" && [ -n "$r" ] && [ "$r" = "${r%% *}" ] \
+           || { echo "region: '$2' is neither 'auto' nor one two-letter country code" >&2; exit 1; } ;;
+    esac
     sed -i "s/^EGRESS_REGION=.*/EGRESS_REGION=$r/" /etc/default/vps-psiphon
     EGRESS_REGION="$r"   # the file was sourced at startup; keep status() honest
     # The image seeds /config on first run only; an existing psiphon.config keeps the
@@ -869,10 +977,13 @@ case "${1:-status}" in
     echo -n "single 50MB : "
     curl -s -o /dev/null --max-time 300 "${S[@]}" -w '%{speed_download}\n' "$U" | awk '{printf "%.1f Mbit/s\n", $1*8/1e6}'
     echo -n "4x parallel : "
-    rm -f /tmp/vpspsi.speed; t0=$(date +%s.%N)
-    for i in 1 2 3 4; do curl -s -o /dev/null --max-time 300 "${S[@]}" -w '%{size_download}\n' "$U" >> /tmp/vpspsi.speed & done
+    # mktemp, not a fixed name: this runs as root, and a predictable path in /tmp is
+    # one anybody on the host can pre-plant as a symlink.
+    tf="$(mktemp)"; t0=$(date +%s.%N)
+    for i in 1 2 3 4; do curl -s -o /dev/null --max-time 300 "${S[@]}" -w '%{size_download}\n' "$U" >> "$tf" & done
     wait; t1=$(date +%s.%N)
-    awk -v a="$t0" -v b="$t1" '{s+=$1} END{printf "%.1f Mbit/s aggregate\n", s*8/(b-a)/1e6}' /tmp/vpspsi.speed ;;
+    awk -v a="$t0" -v b="$t1" '{s+=$1} END{printf "%.1f Mbit/s aggregate\n", s*8/(b-a)/1e6}' "$tf"
+    rm -f "$tf" ;;
   logs)     docker logs --tail "${2:-50}" "$NAME" ;;
   routing)
     cat <<R
@@ -907,21 +1018,47 @@ R
     ;;
   verify)
     rc=0
+    # Every listener on the port is judged, not the first one ss happens to print: a
+    # second one on a wildcard is exactly the case this command exists to catch. The
+    # HTTP proxy is checked too — unauthenticated, it is as open a proxy as the SOCKS.
+    check_port() {
+      local port="$1" what="$2" required="$3" l a found=0
+      while IFS= read -r l; do
+        [ -n "$l" ] || continue
+        found=1
+        echo "listener  : $l   ($what)"
+        a="${l%:*}"; a="${a#[}"; a="${a%]}"; a="${a%%%*}"
+        case "$a" in
+          0.0.0.0|'*'|::|'')
+            echo "  !! WILDCARD BIND — this is an OPEN ${what} PROXY, reachable from the"
+            echo "     internet by anyone who scans port ${port}. Re-run the installer"
+            echo "     with --bind-loopback, or fix BIND in /etc/default/vps-psiphon."
+            rc=1 ;;
+          127.*|::1)
+            echo "            ok — loopback, reachable only from this host" ;;
+          10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|169.254.*|f[cd]*|fe[89ab]*)
+            echo "            ok — private address, not routable from the internet;"
+            echo "            anything on that network (containers on the bridge) reaches it" ;;
+          *)
+            echo "  !! PUBLIC ADDRESS $a — reachable from the internet unless a firewall"
+            echo "     stops it. If that is intended, the access control is yours; otherwise"
+            echo "     re-run the installer without --bind."
+            rc=1 ;;
+        esac
+      done <<EOF
+$(ss -tlnH 2>/dev/null | awk -v p=":${port}\$" '$4 ~ p {print $4}')
+EOF
+      if [ "$found" = 0 ]; then
+        if [ "$required" = 1 ]; then
+          echo "listener  : MISSING — nothing listens on ${port} ($what)"; rc=1
+        else
+          echo "listener  : nothing listens on ${port} ($what)"
+        fi
+      fi
+    }
     echo "configured: ${BIND}:${SOCKS_PORT}"
-    listen="$(ss -tln 2>/dev/null | awk -v p=":${SOCKS_PORT}$" '$4 ~ p {print $4}' | head -1)"
-    if [ -z "$listen" ]; then
-      echo "listener  : MISSING — nothing listens on ${SOCKS_PORT}"; rc=1
-    else
-      echo "listener  : $listen"
-      case "$listen" in
-        0.0.0.0:*|\[::\]:*|\*:*|:::*)
-          echo "  !! WILDCARD BIND — this is an OPEN SOCKS5 PROXY, reachable from the"
-          echo "     internet by anyone who scans port ${SOCKS_PORT}. Re-run the installer"
-          echo "     with --bind-loopback, or fix BIND in /etc/default/vps-psiphon."
-          rc=1 ;;
-        *) echo "            ok — host-private, not routable from outside" ;;
-      esac
-    fi
+    check_port "$SOCKS_PORT" SOCKS5 1
+    [ "$PUBLISH_HTTP" = 1 ] && check_port "$HTTP_PORT" HTTP 0
     ip="$(curl -s --max-time 20 "${S[@]}" https://api.ipify.org 2>/dev/null || true)"
     if [ -n "$ip" ]; then echo "socks     : works, exit $ip"; else echo "socks     : NOT WORKING"; rc=1; fi
     echo
@@ -959,7 +1096,8 @@ R
     # Claiming "removed" is worth nothing unmeasured — look at the disk and say so.
     left=""
     for p in /usr/local/sbin/vps-psiphon /usr/local/sbin/vps-psiphon-run \
-             /usr/local/sbin/vps-psiphon-watchdog /etc/default/vps-psiphon \
+             /usr/local/sbin/vps-psiphon-watchdog \
+             /usr/local/sbin/vps-psiphon-advance-region /etc/default/vps-psiphon \
              /etc/systemd/system/vps-psiphon.service \
              /etc/systemd/system/vps-psiphon-watchdog.service \
              /etc/systemd/system/vps-psiphon-watchdog.timer \
@@ -972,21 +1110,26 @@ R
       && echo "note: image $IMAGE kept, something else on this host references it"
     [ -n "$left" ] && { echo "removed, but these remain:$left" >&2; exit 1; }
     echo "removed: units, container, image, config, state, log — and this CLI itself" ;;
-  *) echo "usage: vps-psiphon {status|rotate|region <CC>|pool '<CC CC …>'|accept '<CC CC …>'|speed|logs [n]|watchdog [n]|uninstall}" ;;
+  *) echo "usage: vps-psiphon {status|verify|routing|rotate|region <CC|auto>|pool '<CC CC …>'|accept '<CC CC …>|any'|speed|logs [n]|watchdog [n]|uninstall}" ;;
 esac
 CLI
+# IMAGE is validated to [A-Za-z0-9._/:@-], so it cannot break out of the | delimiter.
+sed -i "s|@@IMAGE@@|$IMAGE|" /usr/local/sbin/vps-psiphon
 chmod 755 /usr/local/sbin/vps-psiphon
 
 # ---- units ------------------------------------------------------------------
-cat > /etc/systemd/system/vps-psiphon.service <<'U1'
+# Unquoted: the container name is baked in, so a NAME other than the default is
+# still the one ExecStop stops.
+cat > /etc/systemd/system/vps-psiphon.service <<U1
 [Unit]
 Description=vps-psiphon egress tunnel (host-private SOCKS5 for xray)
 After=docker.service network-online.target
+Wants=network-online.target
 Requires=docker.service
 
 [Service]
 ExecStart=/usr/local/sbin/vps-psiphon-run
-ExecStop=/usr/bin/docker stop -t 10 vps-psiphon
+ExecStop=/usr/bin/docker stop -t 10 $NAME
 Restart=always
 RestartSec=10
 TimeoutStartSec=0
