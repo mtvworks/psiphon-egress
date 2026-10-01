@@ -109,7 +109,8 @@ vps-psiphon uninstall               removes everything it wrote, including itsel
 ```
 
 `rotate`, `region`, `pool`, `accept` and `update-image` share a lock with the
-watchdog, so a manual command never lands in the middle of a check.
+watchdog and the installer, so a manual command never lands in the middle of a
+check or a reinstall.
 
 ## Keeping the image current
 
