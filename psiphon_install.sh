@@ -74,6 +74,9 @@ ACCEPT_REGIONS=""; ACCEPT_REGIONS_SET=0
 # Optional Telegram alerts from the watchdog (rotation, denied country). Both empty =
 # off. Kept across reinstalls unless given again; '' turns them off.
 TG_TOKEN=""; TG_TOKEN_SET=0; TG_CHAT=""; TG_CHAT_SET=0
+# The token may come from the environment instead of --tg-token, so it stays out of
+# `ps` and the shell history: VPSPSI_TG_TOKEN=... bash psiphon_install.sh --tg-chat ...
+if [ -n "${VPSPSI_TG_TOKEN+x}" ]; then TG_TOKEN="$VPSPSI_TG_TOKEN"; TG_TOKEN_SET=1; fi
 # node_exporter textfile collector directory for the watchdog's metrics. Unset means:
 # keep the stored value, else use the collector's usual directory if it exists.
 METRICS_DIR=""; METRICS_DIR_SET=0
@@ -1309,6 +1312,22 @@ case "${1:-status}" in
     [ "$(img_repo "$old"):$(img_tag "$old")" = "$repo:$tag" ] || echo "following : $repo:$tag from now on"
     echo "switching — the tunnel restarts, live connections drop"
     systemctl restart vps-psiphon.service; sleep 45
+    # The old image is the rollback: it is removed only once the new build has carried
+    # a request. Otherwise the pin goes back and the old build runs again, so a broken
+    # release costs one restart instead of a dead tunnel and a re-pull by digest.
+    ok=0
+    for _ in 1 2 3; do
+      [ "$(curl -s -o /dev/null --max-time 20 "${S[@]}" -w '%{http_code}' \
+            https://www.gstatic.com/generate_204 2>/dev/null)" = 204 ] && { ok=1; break; }
+      sleep 15
+    done
+    if [ "$ok" = 0 ]; then
+      echo "update-image: the new build carries no traffic — rolling back to $old" >&2
+      sed -i "s|^IMAGE=.*|IMAGE=$old|" /etc/default/vps-psiphon
+      IMAGE="$old"
+      systemctl restart vps-psiphon.service; sleep 45
+      status; exit 1
+    fi
     # Only a pinned reference is removed: an unpinned tag may by now name the image
     # just switched to.
     [ -n "$(img_digest "$old")" ] && rm_image "$old" && echo "removed   : $(img_canon "$old")"

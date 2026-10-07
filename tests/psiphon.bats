@@ -220,6 +220,16 @@ $R@$NEW" run_cli update-image
   grep -q "docker image rm $R@$OLD" "$STUB_LOG"
 }
 
+@test "cli: update-image rolls back and keeps the old build when the new one carries no traffic" {
+  echo "IMAGE=$R:latest@$OLD" >> "$ROOT/etc/default/vps-psiphon"
+  FAKE_204=000 FAKE_DIGESTS="$R@$NEW" run_cli update-image
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"rolling back"* ]]
+  grep -q "^IMAGE=$R:latest@$OLD\$" "$ROOT/etc/default/vps-psiphon"
+  [ "$(grep -c 'systemctl restart vps-psiphon.service' "$STUB_LOG")" -eq 2 ]
+  refute grep -q "docker image rm $R@$OLD" "$STUB_LOG"
+}
+
 @test "cli: switching tag removes the old build with the tag still on it, not a moved tag" {
   echo "IMAGE=$R:v2@$OLD" >> "$ROOT/etc/default/vps-psiphon"
   # :v2 still names the old build → both its digest and :v2 go.
