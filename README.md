@@ -8,6 +8,8 @@ address, and xray reaches it through a four-line outbound. systemd owns the
 lifecycle. A watchdog rotates the exit when it stops being *usable* — which is
 not the same question as whether it is still *up*.
 
+> Русская версия: [README.ru.md](README.ru.md)
+
 > Derived from [Chara-Freedom/vps-psiphon](https://github.com/Chara-Freedom/vps-psiphon)
 > (MIT). Almost all the code is theirs — see [CREDITS.md](CREDITS.md) for what
 > came from where and what we changed.
@@ -19,7 +21,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/mtvworks/psiphon-egress/main
   --no-http --bind-loopback --region 'DE,NL,FR,AT,CH,SE'
 ```
 
-Requirements: root, docker, curl.
+Requirements: root, docker, curl, `ss` (iproute2), `flock` (util-linux).
+
+Every value is checked before anything is written: country codes (any case,
+comma- or space-separated), ports, an IPv4 `--bind`, memory and pid limits.
+Bad input stops the run instead of landing in a file that root sources.
 
 Those flags are not decoration:
 
@@ -32,6 +38,13 @@ Those flags are not decoration:
   local API sits there by default.
 - `--region 'DE,NL,…'` makes a rotation pool. Without it the installer picks the
   fastest exit anywhere on earth, which for a European node has meant Singapore.
+
+### Reinstalling
+
+Re-running the installer keeps what the last run settled on: ports, the region
+and pool (including where rotations have moved it), deny/accept lists, watchdog
+tuning, the image, alerts and metrics. An explicit flag always wins;
+`--region ''` goes back to auto.
 
 ## After installing, do the routing
 
@@ -55,8 +68,9 @@ path that works.
 vps-psiphon verify
 ```
 
-Checks the listener is host-private, that SOCKS actually works, and prints the
-one external test that means anything.
+Checks every listener on the SOCKS port — and on the HTTP proxy port, which is
+just as open — flags wildcard *and* public addresses, checks that SOCKS actually
+works, and prints the one external test that means anything.
 
 **Do not use `nc -z`, or any TCP-connect probe, to decide whether the port is
 exposed.** Some providers tarpit every port and complete the TCP handshake for
@@ -87,10 +101,54 @@ vps-psiphon rotate                  new tunnel, new exit, advances the pool
 vps-psiphon region DE               pin one country
 vps-psiphon pool 'DE NL FR'         set the rotation pool
 vps-psiphon accept 'DE NL'          which verdicts are acceptable
+vps-psiphon update-image [--check]  move the pinned digest to the followed tag's build
+vps-psiphon notify-test             send a test Telegram alert
 vps-psiphon speed                   throughput through the tunnel
 vps-psiphon logs / watchdog         container log / watchdog journal
 vps-psiphon uninstall               removes everything it wrote, including itself
 ```
+
+`rotate`, `region`, `pool`, `accept` and `update-image` share a lock with the
+watchdog and the installer, so a manual command never lands in the middle of a
+check or a reinstall.
+
+## Keeping the image current
+
+The image is pinned by digest so it cannot change under you — which also means it
+never picks up a fix on its own. `IMAGE` is stored as `repo:tag@sha256:…`: the
+digest is what runs, the tag is what updates follow. The default follows
+`:latest`; a node installed with `--image repo:v2` keeps following `:v2`.
+
+- `vps-psiphon update-image --check` pulls the followed tag and shows whether the
+  digest moved; nothing changes.
+- `vps-psiphon update-image` switches to the new digest, restarts the tunnel (live
+  connections drop) and removes the old image.
+- `vps-psiphon update-image repo:v3` switches **and makes `:v3` the followed tag**
+  from then on. A bare digest (`repo@sha256:…`) pins that build and keeps the
+  current tag.
+
+A reinstall keeps the pinned digest and the followed tag. `--image repo@sha256:…`
+(no tag) on a reinstall keeps the tag followed so far.
+
+## Alerts and metrics
+
+Both are off unless configured.
+
+- **Telegram**: `--tg-token <bot token> --tg-chat <chat id>` (or `VPSPSI_TG_TOKEN=<bot token>` in the environment instead of `--tg-token`, which keeps the token out of `ps` and the shell history). The watchdog sends
+  an alert on every rotation (reason, old → new exit, region step), the first
+  time an exit is seen in a denied country, and when a rotation did not bring the
+  tunnel back. Alerts go directly, not through the tunnel. The token is kept in
+  `/etc/default/vps-psiphon` (mode 0600) and never passed on a command line.
+  `vps-psiphon notify-test` checks the setup.
+- **Prometheus**: if `/var/lib/node_exporter/textfile_collector` exists (or
+  `--metrics-dir` points elsewhere), the watchdog writes `vps-psiphon.prom` there
+  after every check: `vps_psiphon_up`, `vps_psiphon_check_ok`,
+  `vps_psiphon_throughput_kbps`, `vps_psiphon_window_failures`,
+  `vps_psiphon_rotations_total`, `vps_psiphon_last_rotate_timestamp_seconds`,
+  `vps_psiphon_captcha`, `vps_psiphon_country_info{gl="XX"}`,
+  `vps_psiphon_last_check_timestamp_seconds`.
+
+The watchdog log is rotated weekly through `/etc/logrotate.d/vps-psiphon`.
 
 ## What this copy changed
 
@@ -100,9 +158,15 @@ vps-psiphon uninstall               removes everything it wrote, including itsel
 | **Container ceilings** | `--memory 512m`, `--pids-limit 256`, log rotation caps. On a 1 GB node the OOM killer reaches for the largest process, and that is xray, not psiphon. Overridable via `--memory` / `--pids-limit`. |
 | **`routing`** | prints the panel rules the outbound is useless without, UDP handling included. |
 | **`verify`** | answers "is this reachable from outside" in a way TCP-connect probes cannot. |
+| **Input checks** | every flag is validated before anything is written; country codes are normalised. |
+| **Reinstall keeps state** | region, image, tuning and alerts survive a re-run instead of silently resetting. |
+| **Watchdog fixes** | a timed-out transfer is judged as slow, not as a dead tunnel; `status` applies the deny-list like the watchdog does; one lock for the watchdog and manual commands. |
+| **`update-image`, alerts, metrics** | moving the digest pin in the open; Telegram alerts; node_exporter metrics; log rotation. |
+| **Tests and CI** | `bats tests` and `tests/lint.sh` (shellcheck, generated scripts included) run on every push. |
 
-Everything else — and in particular the exit-quality watchdog, which is the
-reason to choose this family of scripts at all — is upstream's work, unchanged.
+The exit-quality watchdog itself — the reason to choose this family of scripts at
+all — is upstream's design; the changes above fix and extend it without changing
+what it judges.
 
 ## Choosing an exit country
 
@@ -133,6 +197,13 @@ open proxy.** Inside the container psiphon binds `0.0.0.0`, so a plain
 address of the host, unauthenticated. This installer never publishes on a
 wildcard; a `--bind` you type yourself is honoured as given, and defending that
 address is then yours to do.
+
+## Development
+
+```bash
+bash tests/lint.sh   # shellcheck: the installer and the scripts it generates
+bats tests           # no root, docker or systemd needed — everything is stubbed
+```
 
 ## License
 
