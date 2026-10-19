@@ -45,13 +45,25 @@ NAME="${NAME:-vps-psiphon}"
 # Steady state measured across three nodes is 8-22 MiB, so 512m is ~25x headroom and
 # still a ceiling. json-file logging is unbounded by default and psiphon is chatty
 # on every dial, hence the rotation caps.
+# Asked for (flag or environment) or not, like IMAGE: a ceiling lowered by hand for a
+# small node must survive a reinstall instead of quietly going back to the default.
+MEM_LIMIT_SET=0;    [ -n "${MEM_LIMIT:-}" ]    && MEM_LIMIT_SET=1
+PIDS_LIMIT_SET=0;   [ -n "${PIDS_LIMIT:-}" ]   && PIDS_LIMIT_SET=1
+LOG_MAX_SIZE_SET=0; [ -n "${LOG_MAX_SIZE:-}" ] && LOG_MAX_SIZE_SET=1
+LOG_MAX_FILE_SET=0; [ -n "${LOG_MAX_FILE:-}" ] && LOG_MAX_FILE_SET=1
 MEM_LIMIT="${MEM_LIMIT:-512m}"
 PIDS_LIMIT="${PIDS_LIMIT:-256}"
 LOG_MAX_SIZE="${LOG_MAX_SIZE:-10m}"
 LOG_MAX_FILE="${LOG_MAX_FILE:-3}"
 # Resolved after preflight, because the default is an address that does not exist
-# until docker is running. Empty here means "not chosen yet".
+# until docker is running. Empty here means "not chosen yet"; a reinstall takes the
+# stored one before falling back to that default (restore_bind below).
 BIND="${BIND:-}"
+# Services the exit is for, checked by the watchdog through the tunnel; a refusal
+# (403/451) rotates. Unset means: keep the stored list, else this default. '' turns
+# the check off. The reasoning sits beside PROBE_URLS in the env file below.
+PROBE_URLS_DEFAULT="https://gemini.google.com/app"
+PROBE_URLS=""; PROBE_URLS_SET=0
 
 SOCKS_PORT="${SOCKS_PORT:-1080}"
 HTTP_PORT="${HTTP_PORT:-8080}"
@@ -184,11 +196,18 @@ psiphon_install.sh [options]
                        reachable by containers on the default bridge — at the
                        price of that userspace copy. Neither address is
                        reachable from the internet.
+                       With neither flag, a reinstall keeps the stored address:
+                       xray's outbound dials it, so it moves only when asked.
   --image REF          container image, default swarupsengupta2007/psiphon pinned
                        by digest
-  --memory SIZE        container memory ceiling (default 512m)
-  --pids-limit N       container pid ceiling (default 256)
+  --memory SIZE        container memory ceiling (default 512m; a reinstall keeps
+                       the stored one)
+  --pids-limit N       container pid ceiling (default 256; kept the same way)
   --no-watchdog        skip the watchdog
+  --probe-urls 'URL …' https:// pages the exit is for, checked by the watchdog
+                       through the tunnel; a 403 or 451 from any of them rotates.
+                       Default https://gemini.google.com/app; kept across
+                       reinstalls; '' turns the check off.
   --tg-token TOKEN     Telegram bot token for watchdog alerts (rotations, denied
   --tg-chat ID         country). Both are needed; '' turns alerts off. Kept across
                        reinstalls. Test with: vps-psiphon notify-test
@@ -231,9 +250,10 @@ while [ $# -gt 0 ]; do
     --tg-token)      TG_TOKEN="${2:-}"; TG_TOKEN_SET=1; shift 2 ;;
     --tg-chat)       TG_CHAT="${2:-}";  TG_CHAT_SET=1;  shift 2 ;;
     --metrics-dir)   METRICS_DIR="${2:-}"; METRICS_DIR_SET=1; shift 2 ;;
-    --memory)        MEM_LIMIT="${2:?}";     shift 2 ;;
-    --pids-limit)    PIDS_LIMIT="${2:?}";    shift 2 ;;
+    --memory)        MEM_LIMIT="${2:?}";  MEM_LIMIT_SET=1;  shift 2 ;;
+    --pids-limit)    PIDS_LIMIT="${2:?}"; PIDS_LIMIT_SET=1; shift 2 ;;
     --no-watchdog)   WATCHDOG=0;             shift   ;;
+    --probe-urls)    PROBE_URLS="${2:-}"; PROBE_URLS_SET=1; shift 2 ;;
     -h|--help)       usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage; exit 1 ;;
   esac
@@ -253,16 +273,24 @@ is_port "$SOCKS_PORT" || die "--socks-port: '$SOCKS_PORT' is not a port number"
 is_port "$HTTP_PORT"  || die "--http-port: '$HTTP_PORT' is not a port number"
 # IPv4 only: the launcher publishes "$BIND:port:port" and the probes dial
 # "$BIND:port", neither of which is written to take an IPv6 literal.
+is_ipv4() {
+  printf '%s\n' "$1" | grep -qxE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
+    && [ "$(printf '%s' "$1" | tr '.' '\n' | awk '$1 > 255' | wc -l)" = 0 ]
+}
 if [ -n "$BIND" ]; then
-  printf '%s\n' "$BIND" | grep -qxE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
-    && [ "$(printf '%s' "$BIND" | tr '.' '\n' | awk '$1 > 255' | wc -l)" = 0 ] \
-    || die "--bind: '$BIND' is not an IPv4 address"
+  is_ipv4 "$BIND" || die "--bind: '$BIND' is not an IPv4 address"
 fi
-printf '%s\n' "$MEM_LIMIT"  | grep -qxE '[0-9]+[bkmgBKMG]?' || die "--memory: '$MEM_LIMIT' is not a size like 512m"
-printf '%s\n' "$PIDS_LIMIT" | grep -qxE '[0-9]+'            || die "--pids-limit: '$PIDS_LIMIT' is not a number"
 printf '%s\n' "$IMAGE"      | grep -qxE '[A-Za-z0-9._/:@-]+' || die "--image: '$IMAGE' is not an image reference"
 printf '%s\n' "$NAME"       | grep -qxE '[A-Za-z0-9][A-Za-z0-9_.-]*' || die "NAME: '$NAME' is not a container name"
-# Checked again after the stored values are restored, since those are sourced too.
+# These are checked again after the stored values are restored, since those are
+# sourced too and go straight into docker arguments.
+check_limits() {
+  printf '%s\n' "$MEM_LIMIT"    | grep -qxE '[0-9]+[bkmgBKMG]?' || die "--memory: '$MEM_LIMIT' is not a size like 512m"
+  printf '%s\n' "$PIDS_LIMIT"   | grep -qxE '[0-9]+'            || die "--pids-limit: '$PIDS_LIMIT' is not a number"
+  printf '%s\n' "$LOG_MAX_SIZE" | grep -qxE '[0-9]+[kmgKMG]?'   || die "LOG_MAX_SIZE: '$LOG_MAX_SIZE' is not a size like 10m"
+  printf '%s\n' "$LOG_MAX_FILE" | grep -qxE '[0-9]+'            || die "LOG_MAX_FILE: '$LOG_MAX_FILE' is not a number"
+}
+check_limits
 check_extras() {
   [ -z "$TG_TOKEN" ] || printf '%s\n' "$TG_TOKEN" | grep -qxE '[0-9]+:[A-Za-z0-9_-]+' \
     || die "--tg-token: not a bot token (digits:letters, as BotFather prints it)"
@@ -270,6 +298,17 @@ check_extras() {
     || die "--tg-chat: expected a numeric chat id or @channelname"
   [ -z "$METRICS_DIR" ] || printf '%s\n' "$METRICS_DIR" | grep -qxE '/[A-Za-z0-9._/-]*' \
     || die "--metrics-dir: expected an absolute path"
+  # Normalised to single spaces, then each URL held to plain https:// characters: the
+  # list is written single-quoted into a file root sources, and the watchdog hands
+  # every entry to curl. Read into an array, not word-split, so a '?' in a URL is
+  # never taken for a glob.
+  local -a urls; local u
+  PROBE_URLS="$(printf '%s' "$PROBE_URLS" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//')"
+  read -r -a urls <<< "$PROBE_URLS"
+  for u in "${urls[@]}"; do
+    printf '%s\n' "$u" | grep -qxE 'https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/?=&%+-]*)?' \
+      || die "--probe-urls: '$u' is not a plain https:// URL (letters, digits and ._~/?=&%+- only)"
+  done
 }
 check_extras
 
@@ -310,6 +349,44 @@ docker_gateway() {
   [ -n "$g" ] || g="$(docker network inspect bridge \
                       -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null || true)"
   printf '%s' "$g"
+}
+# A reinstall keeps the address the last run published on. xray's outbound in the
+# panel dials it, out of this script's reach, and the default below is a different
+# address: every node installed with --bind-loopback and re-run bare used to move to
+# the gateway, warn, and carry nothing until the outbound was edited by hand. --bind
+# or --bind-loopback still moves it, and the move is announced further down.
+restore_bind() {
+  [ -z "$BIND" ] && [ -r "$ENVF" ] || return 0
+  BIND="$(sed -n 's/^BIND=//p' "$ENVF" | head -1 | tr -d "'")"
+  [ -n "$BIND" ] || return 0
+  is_ipv4 "$BIND" || die "BIND '$BIND' in $ENVF is not an IPv4 address"
+  say "keeping the published address $BIND from the previous install"
+}
+restore_bind
+# The container ceilings likewise, unless given again: a node sized down by hand
+# (--memory 256m on a 1 GB box) went back to the 512m default on every bare re-run.
+# Called from the restore block further down; checked again after it (check_limits).
+restore_limits() {
+  local v
+  if [ "$MEM_LIMIT_SET" = 0 ]; then
+    v="$(sed -n 's/^MEM_LIMIT=//p' "$ENVF" | head -1 | tr -d "'")"
+    if [ -n "$v" ] && [ "$v" != "$MEM_LIMIT" ]; then
+      say "keeping memory ceiling $v from the previous install"
+    fi
+    [ -z "$v" ] || MEM_LIMIT="$v"
+  fi
+  if [ "$PIDS_LIMIT_SET" = 0 ]; then
+    v="$(sed -n 's/^PIDS_LIMIT=//p' "$ENVF" | head -1 | tr -d "'")"
+    [ -z "$v" ] || PIDS_LIMIT="$v"
+  fi
+  if [ "$LOG_MAX_SIZE_SET" = 0 ]; then
+    v="$(sed -n 's/^LOG_MAX_SIZE=//p' "$ENVF" | head -1 | tr -d "'")"
+    [ -z "$v" ] || LOG_MAX_SIZE="$v"
+  fi
+  if [ "$LOG_MAX_FILE_SET" = 0 ]; then
+    v="$(sed -n 's/^LOG_MAX_FILE=//p' "$ENVF" | head -1 | tr -d "'")"
+    [ -z "$v" ] || LOG_MAX_FILE="$v"
+  fi
 }
 if [ -z "$BIND" ]; then
   BIND="$(docker_gateway)"
@@ -434,11 +511,18 @@ if [ -r "$ENVF" ]; then
   if [ "$METRICS_DIR_SET" = 0 ] && grep -q '^METRICS_DIR=' "$ENVF"; then
     METRICS_DIR="$(stored METRICS_DIR)"; METRICS_DIR_SET=1
   fi
+  # Same rule for the watchdog's targets: emptied on purpose stays off.
+  if [ "$PROBE_URLS_SET" = 0 ] && grep -q '^PROBE_URLS=' "$ENVF"; then
+    PROBE_URLS="$(stored PROBE_URLS)"; PROBE_URLS_SET=1
+  fi
+  restore_limits
 fi
 if [ "$METRICS_DIR_SET" = 0 ] && [ -d "$METRICS_DIR_DEFAULT" ]; then
   METRICS_DIR="$METRICS_DIR_DEFAULT"
 fi
+[ "$PROBE_URLS_SET" = 1 ] || PROBE_URLS="$PROBE_URLS_DEFAULT"
 printf '%s\n' "$IMAGE" | grep -qxE '[A-Za-z0-9._/:@-]+' || die "IMAGE '$IMAGE' in $ENVF is not an image reference"
+check_limits
 check_extras
 is_port "$SOCKS_PORT" || die "SOCKS_PORT '$SOCKS_PORT' in $ENVF is not a port number"
 is_port "$HTTP_PORT"  || die "HTTP_PORT '$HTTP_PORT' in $ENVF is not a port number"
@@ -668,6 +752,15 @@ REGION_POOL='$REGION_POOL'
 # computed default — everything requested, plus US. The word any accepts every verdict.
 # Sanctioned regions are rejected either way: deny is checked first.
 ACCEPT_REGIONS='$ACCEPT_REGIONS'
+# Services this exit is for, space separated, fetched through the tunnel on every check
+# — a GET cut off at 64 KB, so a check costs the head of a page, not the page. A
+# refusal (HTTP 403 or 451) from any of them is a failure like a wrong country and
+# counts towards the same window. Google refuses single Psiphon exits per service while
+# YouTube still reads them as healthy and in an accepted country: on 2026-10-19
+# gemini.google.com answered 403 through an AT exit for hours and no other check here
+# noticed. Nothing else is judged — not a timeout, a 5xx or a redirect: the target can
+# be down for reasons of its own, and a dead tunnel is caught above. Empty disables.
+PROBE_URLS='$PROBE_URLS'
 # Telegram alerts from the watchdog: a rotation (with its reason and the new exit), a
 # denied country the first time it is seen, a rotation that did not bring the tunnel
 # back. Sent directly, not through the tunnel. Both empty = off.
@@ -782,6 +875,10 @@ cat > /usr/local/sbin/vps-psiphon-watchdog <<'WD'
 #      without this gate a 30-90x collapse is invisible. Measured on the YouTube fetch
 #      below, and skipped for THROUGHPUT_GRACE_SEC after a start while the tunnel is
 #      still ramping.
+#   6. refused by target — a service the exit is for (PROBE_URLS) turns it away with
+#      403 or 451 while every check above reads green. Google refuses single Psiphon
+#      exits per service: gemini.google.com answered 403 through an exit that YouTube
+#      judged healthy, fast and US, for hours, until a rotation was made by hand.
 #
 # Google's /sorry captcha is recorded but never rotates on its own: a human solves one
 # in seconds, and churning the tunnel over it costs more than it saves.
@@ -815,6 +912,7 @@ notify() {
 }
 
 fails=0; last_rotate=0; captcha=0; window=""; rotations=0; last_reason=""; denied_gl=""
+refused_seen=""
 # shellcheck source=/dev/null
 [ -r "$STATE" ] && . "$STATE"
 
@@ -828,7 +926,7 @@ for attempt in 1 2; do
   [ "$attempt" = 1 ] && sleep 15
 done
 
-reason=""; gl=""; kbps=""
+reason=""; gl=""; kbps=""; refused=""
 if [ "$alive" = 0 ]; then
   reason="socks-dead"
 else
@@ -932,6 +1030,30 @@ else
       reason="slow-tunnel (timed out after 25s at ${kbps} KB/s, ${got} bytes)"
     fi
   fi
+  # The services the exit is for (PROBE_URLS). Only a refusal is judged: a 403 or 451
+  # is the target turning this address away, which a new exit fixes; a timeout, a 5xx
+  # or a redirect says nothing about the exit, and a dead tunnel is caught above.
+  # --max-filesize ends a healthy fetch after 64 KB — curl exits 63 with the status
+  # already known — so a check does not pull a whole app shell through the tunnel.
+  # Read into an array, not word-split, so a '?' in a URL is never taken for a glob.
+  read -r -a probe_urls <<< "${PROBE_URLS:-}"
+  for u in "${probe_urls[@]}"; do
+    pc="$(curl -s -o /dev/null --max-time 20 --max-filesize 65536 "${S[@]}" \
+          -H 'Accept-Language: en-US' -w '%{http_code}' "$u" 2>/dev/null)"
+    case "$pc" in
+      403|451) h="${u#*://}"; refused="${refused:+$refused, }${h%%/*} $pc" ;;
+    esac
+  done
+  if [ -n "$refused" ]; then
+    [ -z "$reason" ] && reason="refused-by-target ($refused through this exit)"
+    # Alerted once per refusal, like a denied country, not on every check until the
+    # rotation lands.
+    [ "$refused_seen" != "$refused" ] \
+      && notify "$refused through this exit — rotating once the failure window fills"
+    refused_seen="$refused"
+  else
+    refused_seen=""
+  fi
   # Informational only, and logged on change so a captcha'd exit does not fill the log.
   rd="$(curl -s -o /dev/null --max-time 25 "${S[@]}" -w '%{redirect_url}' \
         'https://www.google.com/search?q=status' 2>/dev/null || true)"
@@ -977,12 +1099,13 @@ if [ "$fails" -ge "${FAIL_THRESHOLD:-2}" ] && [ $((now - last_rotate)) -ge "${RO
   else
     notify "rotated $old -> $new${moved:+, region $moved} (${last_reason:-?})"
   fi
-  fails=0; window=""; last_rotate=$now; rotations=$((rotations + 1)); denied_gl=""
+  # A refusal on the new exit is news again, so the once-only alerts start over.
+  fails=0; window=""; last_rotate=$now; rotations=$((rotations + 1)); denied_gl=""; refused_seen=""
 fi
 
 # %q: the reason carries spaces, quotes and parentheses, and this file is sourced.
-printf 'fails=%s\nlast_rotate=%s\ncaptcha=%s\nwindow=%s\nrotations=%s\nlast_reason=%q\ndenied_gl=%s\n' \
-  "$fails" "$last_rotate" "$captcha" "$window" "$rotations" "$last_reason" "$denied_gl" > "$STATE"
+printf 'fails=%s\nlast_rotate=%s\ncaptcha=%s\nwindow=%s\nrotations=%s\nlast_reason=%q\ndenied_gl=%s\nrefused_seen=%q\n' \
+  "$fails" "$last_rotate" "$captcha" "$window" "$rotations" "$last_reason" "$denied_gl" "$refused_seen" > "$STATE"
 
 # node_exporter textfile collector. Written to a temporary file in the same directory
 # and renamed, so a scrape never reads half a file.
@@ -1012,6 +1135,9 @@ if [ -n "${METRICS_DIR:-}" ] && [ -d "$METRICS_DIR" ]; then
       echo '# HELP vps_psiphon_captcha 1 if Google serves a captcha to this exit.'
       echo '# TYPE vps_psiphon_captcha gauge'
       echo "vps_psiphon_captcha $captcha"
+      echo '# HELP vps_psiphon_target_refused 1 if a PROBE_URLS target refused this exit (403/451) on the last check.'
+      echo '# TYPE vps_psiphon_target_refused gauge'
+      echo "vps_psiphon_target_refused $([ -n "$refused" ] && echo 1 || echo 0)"
       if [ -n "$gl" ]; then
         echo "# HELP vps_psiphon_country_info Google's country verdict about this exit."
         echo '# TYPE vps_psiphon_country_info gauge'
@@ -1164,6 +1290,19 @@ status() {
   local rd; rd="$(curl -s -o /dev/null --max-time 25 "${S[@]}" -w '%{redirect_url}' 'https://www.google.com/search?q=status' 2>/dev/null)"
   case "$rd" in */sorry/*) echo "captcha   : yes (informational — no rotation, a human solves it)" ;;
                         *) echo "captcha   : no" ;; esac
+  # Fetched exactly as the watchdog fetches them, and judged by the same rule.
+  local -a probe_urls; local u h pc
+  read -r -a probe_urls <<< "${PROBE_URLS:-}"
+  for u in "${probe_urls[@]}"; do
+    h="${u#*://}"; h="${h%%/*}"
+    pc="$(curl -s -o /dev/null --max-time 20 --max-filesize 65536 "${S[@]}" \
+          -H 'Accept-Language: en-US' -w '%{http_code}' "$u" 2>/dev/null)"
+    case "$pc" in
+      403|451) echo "target    : $h $pc — REFUSED through this exit; the watchdog will rotate" ;;
+      [23][0-9][0-9]) echo "target    : $h $pc ok" ;;
+      *) echo "target    : $h ${pc:-000}   (not judged — only 403/451 rotate)" ;;
+    esac
+  done
   echo -n "traffic   : "; docker exec "$NAME" cat /proc/net/dev 2>/dev/null | awk '/eth0/{printf "rx %.2f GB / tx %.2f GB\n", $2/1e9, $10/1e9}' || echo 'n/a'
 }
 
@@ -1354,10 +1493,24 @@ everything else; leave UDP DIRECT and QUIC/HTTP3 keeps succeeding outside the
 tunnel, so half the traffic ignores it. Blocking UDP makes clients fall back to
 TCP, which is the path that works. DNS is the one exception and goes DIRECT.
 
-To tunnel only some destinations, replace the last rule and leave the rest direct:
+To tunnel only some destinations, keep the first two rules and replace the last
+two with a pair scoped to the same list — the UDP block included, or QUIC to those
+names keeps leaving outside the tunnel — and leave the rest direct:
 
+    { "type": "field", "network": "udp", "outboundTag": "BLOCK",
+      "domain": ["geosite:google-gemini"] },
     { "type": "field", "network": "tcp", "outboundTag": "psiphon-out",
-      "domain": ["geosite:google", "openai.com"] }
+      "domain": ["geosite:google-gemini"] }
+
+Prefer the geosite category to a hand-written list of names. A service is more
+hosts than its front page: Gemini's chat goes to geminiweb-pa.clients6.google.com,
+the Android app to robinfrontend-pa / proactivebackend-pa / geller-pa
+.googleapis.com, and a list naming gemini.google.com alone tunnels the page while
+the conversation leaves directly from the node — two addresses for one session.
+Domain rules need sniffing on the inbound (destOverride http, tls, quic).
+
+Whatever you tunnel, list its front page in PROBE_URLS (--probe-urls) so the
+watchdog notices when that service, rather than the tunnel, refuses the exit.
 
 Nothing here is applied for you: the panel owns the node's xray config, and a
 config written on the node is overwritten on the next sync.

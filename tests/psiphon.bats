@@ -37,7 +37,8 @@ refute() { if "$@"; then echo "expected to fail: $*" >&2; return 1; fi; }
   for args in "--region d" "--bind 1.2.3.999" "--bind ::1" "--socks-port 0" \
               "--socks-port 70000" "--memory 1x" "--device-region usa" \
               "--tg-token nope" "--tg-chat x-y" "--metrics-dir relative/path" \
-              "--accept DE,xyz"; do
+              "--accept DE,xyz" "--probe-urls http://plain.example/" \
+              "--probe-urls https://x.example/a'b" "--probe-urls https://x.example/\$(id)"; do
     # shellcheck disable=SC2086
     run bash "$INSTALLER" $args
     [ "$status" -eq 1 ]
@@ -57,6 +58,49 @@ refute() { if "$@"; then echo "expected to fail: $*" >&2; return 1; fi; }
   REGION_POOL_SET=0; EGRESS_REGION="";  eval "$block"; [ "$EGRESS_REGION" = NL ]
   REGION_POOL_SET=1; EGRESS_REGION="";  eval "$block"; [ "$EGRESS_REGION" = "" ]
   REGION_POOL_SET=0; EGRESS_REGION=DE;  eval "$block"; [ "$EGRESS_REGION" = DE ]
+  rm -f "$ENVF"
+}
+
+@test "reinstall keeps the published address and the container ceilings" {
+  say() { :; }
+  die() { echo "ERROR: $*"; exit 1; }
+  eval "$(installer_fn is_ipv4)"
+  eval "$(installer_fn restore_bind)"
+  eval "$(installer_fn restore_limits)"
+  ENVF="$(mktemp)"
+  printf 'BIND=127.0.0.1\nMEM_LIMIT=256m\nPIDS_LIMIT=128\nLOG_MAX_SIZE=5m\nLOG_MAX_FILE=2\n' > "$ENVF"
+  # Bare reinstall: the stored address, not the gateway default xray does not dial.
+  BIND="";         restore_bind; [ "$BIND" = 127.0.0.1 ]
+  # --bind / --bind-loopback (or BIND in the environment) still move it.
+  BIND=172.17.0.1; restore_bind; [ "$BIND" = 172.17.0.1 ]
+  MEM_LIMIT=512m; PIDS_LIMIT=256; LOG_MAX_SIZE=10m; LOG_MAX_FILE=3
+  MEM_LIMIT_SET=0; PIDS_LIMIT_SET=0; LOG_MAX_SIZE_SET=0; LOG_MAX_FILE_SET=0
+  restore_limits
+  [ "$MEM_LIMIT" = 256m ] && [ "$PIDS_LIMIT" = 128 ]
+  [ "$LOG_MAX_SIZE" = 5m ] && [ "$LOG_MAX_FILE" = 2 ]
+  # --memory wins over the stored ceiling.
+  MEM_LIMIT=1g; MEM_LIMIT_SET=1; restore_limits; [ "$MEM_LIMIT" = 1g ]
+  # An env from before BIND was recorded leaves the choice to the default.
+  printf 'MEM_LIMIT=256m\n' > "$ENVF"; BIND=""; restore_bind; [ -z "$BIND" ]
+  # A stored address that is not one is refused, never carried into docker run.
+  printf 'BIND=0.0.0.0;id\n' > "$ENVF"; BIND=""
+  run restore_bind
+  [ "$status" -eq 1 ] && [[ "$output" == *"not an IPv4 address"* ]]
+  rm -f "$ENVF"
+}
+
+@test "reinstall keeps PROBE_URLS, an emptied one included; an older env gets the default" {
+  block="$(sed -n '/^  if \[ "\$PROBE_URLS_SET" = 0 \] && grep -q/,/^  fi$/p' "$INSTALLER")"
+  fallback="$(grep -m1 '^\[ "\$PROBE_URLS_SET" = 1 \] || ' "$INSTALLER")"
+  dflt="$(grep -m1 '^PROBE_URLS_DEFAULT=' "$INSTALLER")"
+  [ -n "$block" ] && [ -n "$fallback" ] && [ -n "$dflt" ]
+  eval "$dflt"
+  stored() { sed -n "s/^$1=//p" "$ENVF" | head -1 | tr -d "'"; }
+  apply() { PROBE_URLS=""; PROBE_URLS_SET=0; eval "$block"; eval "$fallback"; }
+  ENVF="$(mktemp)"
+  printf "PROBE_URLS='https://a.example/x'\n" > "$ENVF"; apply; [ "$PROBE_URLS" = https://a.example/x ]
+  printf "PROBE_URLS=''\n" > "$ENVF";                   apply; [ "$PROBE_URLS" = "" ]
+  printf 'NAME=vps-psiphon\n' > "$ENVF";               apply; [ "$PROBE_URLS" = "$PROBE_URLS_DEFAULT" ]
   rm -f "$ENVF"
 }
 
@@ -166,6 +210,47 @@ teardown() { teardown_root; }
   grep -qx 'vps_psiphon_rotations_total 1' "$ROOT/metrics/vps-psiphon.prom"
   # The state file stays sourceable with a reason full of quotes and parentheses.
   bash -c ". '$ROOT/var/lib/vps-psiphon-watchdog.state'; [ \"\$rotations\" = 1 ] && [[ \"\$last_reason\" == denied-country* ]]"
+}
+
+@test "watchdog: a target that refuses the exit alerts once, then rotates" {
+  echo "PROBE_URLS='https://gemini.google.com/app'" >> "$ROOT/etc/default/vps-psiphon"
+  export FAKE_PROBE=403
+  run_watchdog
+  grep -q '^PROBE https://gemini.google.com/app$' "$STUB_LOG"
+  wd_log | grep -q 'check failed (refused-by-target (gemini.google.com 403 through this exit)), 1 of'
+  [ "$(grep -c '^TG .*gemini.google.com 403 through this exit — rotating' "$STUB_LOG")" -eq 1 ]
+  grep -qx 'vps_psiphon_target_refused 1' "$ROOT/metrics/vps-psiphon.prom"
+  grep -qx 'vps_psiphon_check_ok 0' "$ROOT/metrics/vps-psiphon.prom"
+  refute grep -q 'systemctl restart' "$STUB_LOG"
+
+  run_watchdog
+  [ "$(grep -c '^TG .*403 through this exit — rotating' "$STUB_LOG")" -eq 1 ]   # not repeated
+  grep -q 'systemctl restart vps-psiphon.service' "$STUB_LOG"
+  grep -q '^TG .*rotated 203.0.113.9 -> 203.0.113.9, region DE -> NL (refused-by-target (gemini.google.com 403' "$STUB_LOG"
+  # Sourceable, and the once-only alert starts over for the new exit.
+  bash -c ". '$ROOT/var/lib/vps-psiphon-watchdog.state'; [ -z \"\$refused_seen\" ] && [[ \"\$last_reason\" == refused-by-target* ]]"
+}
+
+@test "watchdog: a target that times out, errors or redirects is not judged" {
+  echo "PROBE_URLS='https://gemini.google.com/app https://down.example/'" >> "$ROOT/etc/default/vps-psiphon"
+  for c in 000 500 302 429; do FAKE_PROBE=$c run_watchdog; done
+  grep -q '^PROBE https://down.example/$' "$STUB_LOG"
+  refute grep -q 'check failed' "$WDLOG"
+  refute grep -q '^TG ' "$STUB_LOG"
+  grep -qx 'vps_psiphon_target_refused 0' "$ROOT/metrics/vps-psiphon.prom"
+}
+
+@test "watchdog: only the refusing target is named; PROBE_URLS='' turns the check off" {
+  echo "PROBE_URLS='https://down.example/ https://gemini.google.com/app?hl=en'" >> "$ROOT/etc/default/vps-psiphon"
+  FAKE_PROBE=451 run_watchdog
+  wd_log | grep -q 'refused-by-target (gemini.google.com 451 through this exit)'
+  grep -q '^PROBE https://gemini.google.com/app?hl=en$' "$STUB_LOG"
+
+  teardown_root; setup_root
+  echo "PROBE_URLS=''" >> "$ROOT/etc/default/vps-psiphon"
+  FAKE_PROBE=403 run_watchdog
+  refute grep -q '^PROBE ' "$STUB_LOG"
+  refute grep -q 'check failed' "$WDLOG"
 }
 
 @test "watchdog: skips while another command holds the lock" {
