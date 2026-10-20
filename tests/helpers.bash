@@ -72,7 +72,9 @@ EOF
 #   FAKE_YT_RC    its exit status                  (default 0)
 #   FAKE_YT_BODY  its body                         (default 60 KB carrying GL DE)
 #   FAKE_IP       ipify answer                     (default 203.0.113.9)
-# Telegram calls are recorded in $STUB_LOG as "TG <text>".
+#   FAKE_PROBE    status of a PROBE_URLS target on gemini.google.com (default 200);
+#                 a target on *.example times out (000, exit 28), like one that is down
+# Telegram calls are recorded in $STUB_LOG as "TG <text>", probe fetches as "PROBE <url>".
 write_stubs() {
   cat > "$ROOT/bin/curl" <<'C'
 #!/usr/bin/env bash
@@ -101,6 +103,8 @@ case "$url" in
     exit "${FAKE_YT_RC:-0}" ;;
   *ipify*) printf '%s' "${FAKE_IP:-203.0.113.9}" ;;
   *google.com/search*) : ;;
+  *gemini.google.com*) echo "PROBE $url" >> "$STUB_LOG"; printf '%s' "${FAKE_PROBE:-200}" ;;
+  *.example*) echo "PROBE $url" >> "$STUB_LOG"; printf '000'; exit 28 ;;
 esac
 exit 0
 C

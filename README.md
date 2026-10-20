@@ -41,10 +41,16 @@ Those flags are not decoration:
 
 ### Reinstalling
 
-Re-running the installer keeps what the last run settled on: ports, the region
-and pool (including where rotations have moved it), deny/accept lists, watchdog
-tuning, the image, alerts and metrics. An explicit flag always wins;
+Re-running the installer keeps what the last run settled on: ports and the
+address they are published on, the region and pool (including where rotations
+have moved it), deny/accept lists, watchdog tuning and its targets, the container
+ceilings, the image, alerts and metrics. An explicit flag always wins;
 `--region ''` goes back to auto.
+
+The address matters most: xray's outbound in the panel dials it, so a bare re-run
+of a node installed with `--bind-loopback` must not move it to the gateway
+default. Older versions did, and the tunnel then read healthy while carrying
+nothing until the outbound was edited by hand.
 
 ## After installing, do the routing
 
@@ -61,6 +67,35 @@ dies along with everything else; leave UDP direct and QUIC/HTTP3 keeps succeedin
 *outside* the tunnel, so a large share of traffic quietly ignores it. Blocking
 UDP — with DNS as the single exception — pushes clients onto TCP, which is the
 path that works.
+
+To tunnel one service rather than everything, scope **both** the UDP block and the
+TCP rule to the same list, and prefer the geosite category to hand-written names —
+`geosite:google-gemini` rather than `gemini.google.com`. A service is more hosts
+than its front page: Gemini's chat goes to `geminiweb-pa.clients6.google.com`, the
+Android app to `robinfrontend-pa` / `proactivebackend-pa` / `geller-pa.googleapis.com`.
+A list naming the page alone tunnels the page while the conversation leaves
+directly from the node, two addresses for one session. `routing` prints the
+scoped pair.
+
+## Checking the services the exit is for
+
+A tunnel can be alive, fast and in an accepted country and still be useless:
+Google refuses single Psiphon exits per service. On 2026-10-19
+`gemini.google.com` answered **403** through an AT exit for hours while every
+check here read green, until a rotation was made by hand.
+
+So the watchdog also fetches the services the exit is for, listed in
+`PROBE_URLS` (`--probe-urls 'https://… https://…'`, default
+`https://gemini.google.com/app`, `''` turns it off, kept across reinstalls):
+
+- through the tunnel, on every check, as a GET cut off at 64 KB — a check costs
+  the head of a page, not the page;
+- a **403 or 451** from any of them is a failure like a wrong country: it counts
+  towards the same window, alerts once, and rotates;
+- nothing else is judged — not a timeout, a 5xx or a redirect. The target can be
+  down for reasons of its own, and a dead tunnel is caught by the other checks.
+
+`vps-psiphon status` fetches the same URLs and prints a `target` line for each.
 
 ## Verifying it is not an open proxy
 
@@ -94,7 +129,7 @@ where egress port filtering cannot see it.
 ## Managing it
 
 ```
-vps-psiphon status                  exit IP, country, captcha, throughput
+vps-psiphon status                  exit IP, country, captcha, throughput, targets
 vps-psiphon verify                  exposure + functional check
 vps-psiphon routing                 panel rules, with the reasoning
 vps-psiphon rotate                  new tunnel, new exit, advances the pool
@@ -136,8 +171,8 @@ Both are off unless configured.
 
 - **Telegram**: `--tg-token <bot token> --tg-chat <chat id>` (or `VPSPSI_TG_TOKEN=<bot token>` in the environment instead of `--tg-token`, which keeps the token out of `ps` and the shell history). The watchdog sends
   an alert on every rotation (reason, old → new exit, region step), the first
-  time an exit is seen in a denied country, and when a rotation did not bring the
-  tunnel back. Alerts go directly, not through the tunnel. The token is kept in
+  time an exit is seen in a denied country or refused by a target, and when a
+  rotation did not bring the tunnel back. Alerts go directly, not through the tunnel. The token is kept in
   `/etc/default/vps-psiphon` (mode 0600) and never passed on a command line.
   `vps-psiphon notify-test` checks the setup.
 - **Prometheus**: if `/var/lib/node_exporter/textfile_collector` exists (or
@@ -145,8 +180,8 @@ Both are off unless configured.
   after every check: `vps_psiphon_up`, `vps_psiphon_check_ok`,
   `vps_psiphon_throughput_kbps`, `vps_psiphon_window_failures`,
   `vps_psiphon_rotations_total`, `vps_psiphon_last_rotate_timestamp_seconds`,
-  `vps_psiphon_captcha`, `vps_psiphon_country_info{gl="XX"}`,
-  `vps_psiphon_last_check_timestamp_seconds`.
+  `vps_psiphon_captcha`, `vps_psiphon_target_refused`,
+  `vps_psiphon_country_info{gl="XX"}`, `vps_psiphon_last_check_timestamp_seconds`.
 
 The watchdog log is rotated weekly through `/etc/logrotate.d/vps-psiphon`.
 
@@ -159,14 +194,16 @@ The watchdog log is rotated weekly through `/etc/logrotate.d/vps-psiphon`.
 | **`routing`** | prints the panel rules the outbound is useless without, UDP handling included. |
 | **`verify`** | answers "is this reachable from outside" in a way TCP-connect probes cannot. |
 | **Input checks** | every flag is validated before anything is written; country codes are normalised. |
-| **Reinstall keeps state** | region, image, tuning and alerts survive a re-run instead of silently resetting. |
+| **Reinstall keeps state** | region, published address, container ceilings, image, tuning and alerts survive a re-run instead of silently resetting. |
 | **Watchdog fixes** | a timed-out transfer is judged as slow, not as a dead tunnel; `status` applies the deny-list like the watchdog does; one lock for the watchdog and manual commands. |
+| **Target checks** | the services the exit is for (`PROBE_URLS`) are fetched through it; a 403/451 rotates — Google refuses single exits per service while the other checks read green. |
 | **`update-image`, alerts, metrics** | moving the digest pin in the open; Telegram alerts; node_exporter metrics; log rotation. |
 | **Tests and CI** | `bats tests` and `tests/lint.sh` (shellcheck, generated scripts included) run on every push. |
 
 The exit-quality watchdog itself — the reason to choose this family of scripts at
-all — is upstream's design; the changes above fix and extend it without changing
-what it judges.
+all — is upstream's design; the changes above fix and extend it. The one new
+judgement, target refusals, asks upstream's own question — is this exit still worth
+having — of the services it is actually used for.
 
 ## Choosing an exit country
 
