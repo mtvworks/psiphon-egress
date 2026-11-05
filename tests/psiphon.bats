@@ -513,6 +513,17 @@ GEM_ERROR_REPLY='[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],{\"11\":[\"Technical E
   [[ "$output" == *"reads like a refusal"* ]]
 }
 
+@test "gemini: only a Google host's /sorry is a captcha; worded refusals match in any case" {
+  echo IMPERSONATE=1 >> "$ROOT/etc/default/vps-psiphon"
+  fake_impersonate
+  FAKE_GEM_CODE=302 FAKE_GEM_PAGE='' FAKE_GEM_HEAD=$'location: https://www.google.com.evil.example/sorry/x\r\n' run_gem
+  [ "$status" -eq 2 ]
+  FAKE_GEM_CODE=302 FAKE_GEM_HEAD=$'location: https://ipv4.google.co.uk/sorry/index\r\n' run_gem
+  [ "$status" -eq 3 ]
+  FAKE_GEM_OUT='[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],null,null,[[\"rc_ab12\",[\"Sorry, Gemini is NOT AVAILABLE in Your Country\"]]]]"]]' run_gem
+  [ "$status" -eq 2 ]
+}
+
 @test "gemini: a keep-alive request that ends before the answer is named" {
   FAKE_KEEPALIVE_EARLY=1 FAKE_GEM_OUT='' run_gem
   [ "$status" -eq 2 ]
@@ -633,7 +644,7 @@ GEM_ERROR_REPLY='[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],{\"11\":[\"Technical E
   wd_log | grep -q 'check not judged: the tunnel restarted during it (it read: gemini-refused'
   refute grep -q 'systemctl restart' "$STUB_LOG"
   # Nothing counted: the window is as it was (empty).
-  grep -q '^window=$' "$ROOT/var/lib/vps-psiphon-watchdog.state"
+  grep -qE "^window=(''|)$" "$ROOT/var/lib/vps-psiphon-watchdog.state"
 }
 
 @test "watchdog: rotations that keep not helping back off, and a passing check ends it" {
@@ -675,6 +686,50 @@ GEM_ERROR_REPLY='[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],{\"11\":[\"Technical E
   refute grep -q 'INPROXY' "$WDLOG"   # older than the container: not this tunnel's
   run_watchdog
   [ "$(grep -c 'tunnel up: ' "$WDLOG")" -eq 1 ]
+}
+
+@test "watchdog: garbage in the state file is reset, never executed or carried forward" {
+  st="$ROOT/var/lib/vps-psiphon-watchdog.state"
+  cat > "$st" <<EOF
+futile=08
+last_rotate=08
+gem_streak=08
+rotations=99999999999999999999
+backoff_seen='1 ;touch $ROOT/PWN;'
+window='1 2'
+tunnel=$FAKE_STARTED
+EOF
+  FAKE_GEM_OUT="$GEM_REFUSED_NEW" run_watchdog
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"value too great"* && "$output" != *"integer expression"* && "$output" != *"command not found"* ]]
+  # last_rotate=08 is 8: long ago, so the decisive refusal rotates.
+  grep -q 'systemctl restart vps-psiphon.service' "$STUB_LOG"
+  run_watchdog
+  [ "$status" -eq 0 ] && [[ "$output" != *"command not found"* ]]
+  [ ! -e "$ROOT/PWN" ]
+  grep -qE '^backoff_seen=[01]$' "$st"
+  grep -qx 'vps_psiphon_rotation_cooldown_seconds 1800' "$ROOT/metrics/vps-psiphon.prom"
+}
+
+@test "watchdog: a last rotation in the future holds one cooldown, not until the clock catches up" {
+  printf 'last_rotate=%s\ntunnel=%s\n' "$(( $(date +%s) + 999999 ))" "$FAKE_STARTED" > "$ROOT/var/lib/vps-psiphon-watchdog.state"
+  FAKE_GEM_OUT="$GEM_REFUSED_NEW" run_watchdog
+  wd_log | grep -qE 'rotation due but held: 1[78][0-9]{2}s of the 1800s cooldown left'
+}
+
+@test "watchdog: FAIL_THRESHOLD=0 does not rotate a healthy tunnel" {
+  sed -i 's/^FAIL_THRESHOLD=.*/FAIL_THRESHOLD=0/' "$ROOT/etc/default/vps-psiphon"
+  run_watchdog
+  refute grep -q 'systemctl restart' "$STUB_LOG"
+}
+
+@test "watchdog: a build without a Chrome wrapper counts as missing" {
+  echo IMPERSONATE=1 >> "$ROOT/etc/default/vps-psiphon"
+  mkdir -p "$ROOT/opt/vps-psiphon/curl-impersonate"
+  printf '#!/bin/sh\n' > "$ROOT/opt/vps-psiphon/curl-impersonate/curl-impersonate"
+  chmod +x "$ROOT/opt/vps-psiphon/curl-impersonate/curl-impersonate"
+  run_watchdog
+  grep -q '^TG .*no curl-impersonate build is installed' "$STUB_LOG"
 }
 
 # ---------------------------------------------------------------- launcher --
@@ -790,6 +845,49 @@ launcher_mode() { awk '{print $2}' "$ROOT/var/lib/vps-psiphon-run.state"; }
   [ ! -e "$ROOT/config/psiphon.config" ]
   [ "$(launcher_mode)" = pending ]
   grep -q '^docker run --rm --name vps-psiphon ' "$STUB_LOG"
+}
+
+@test "launcher: refuses to start on an address or port the installer would not write" {
+  for b in "" " " "0.0.0.0;id"; do
+    sed -i "s/^BIND=.*/BIND='$b'/" "$ROOT/etc/default/vps-psiphon"
+    : > "$STUB_LOG"
+    run_launcher
+    [ "$status" -eq 1 ] && [[ "$output" == *"refusing to publish"* ]]
+    refute grep -q '^docker run --rm --name' "$STUB_LOG"
+  done
+  sed -i "s/^BIND=.*/BIND=127.0.0.1/; s/^SOCKS_PORT=.*/SOCKS_PORT=abc/" "$ROOT/etc/default/vps-psiphon"
+  run_launcher
+  [ "$status" -eq 1 ] && [[ "$output" == *"not a number"* ]]
+}
+
+@test "launcher: leftovers it cannot remove do not stop the start" {
+  psiphon_template > "$ROOT/config/psiphon.config"
+  mkdir -p "$ROOT/config/psiphon.config.new/x" "$ROOT/config/psiphon.config.edit/x"
+  run_launcher
+  [ "$status" -eq 0 ]
+  grep -q '^docker run --rm --name vps-psiphon ' "$STUB_LOG"
+}
+
+@test "launcher: a config that is not JSON is moved aside and seeded afresh; a cut template is not used" {
+  t="$ROOT/template.json"; psiphon_template > "$t"
+  printf '{\n  "LocalSocksProxyPort": 1080,\n' > "$ROOT/config/psiphon.config"
+  FAKE_TEMPLATE="$t" run_launcher
+  [ "$status" -eq 0 ]
+  [ -e "$ROOT/config/psiphon.config.broken" ]
+  jq -e '.DisableTactics == true' "$ROOT/config/psiphon.config"
+  [ "$(launcher_mode)" = no-inproxy ]
+  # A template cut short (docker exited 0 all the same) seeds nothing.
+  rm -f "$ROOT/config/psiphon.config"; head -4 "$t" > "$ROOT/cut.json"
+  FAKE_TEMPLATE="$ROOT/cut.json" run_launcher
+  [ ! -e "$ROOT/config/psiphon.config" ] && [ "$(launcher_mode)" = pending ]
+}
+
+@test "launcher: DisableTactics false set by hand is left, and reported as not excluding in-proxy" {
+  { echo '{'; echo '  "DisableTactics": false,'; psiphon_template | sed 1d; } > "$ROOT/config/psiphon.config"
+  run_launcher
+  [ "$(launcher_mode)" = overridden ]
+  grep -q '"DisableTactics": false' "$ROOT/config/psiphon.config"
+  [[ "$output" == *"tactics stay on"* ]]
 }
 
 # ------------------------------------------------------- installer: switches --

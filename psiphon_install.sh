@@ -1027,9 +1027,19 @@ cat > /usr/local/sbin/vps-psiphon-run <<'RUN'
 set -euo pipefail
 . /etc/default/vps-psiphon
 @@SHARED_FUNCS@@
+log() { printf 'vps-psiphon-run: %s\n' "$*" >&2; }
+# Fails closed. An empty BIND would publish "-p :1080:1080", which docker reads as every
+# interface: an open SOCKS5 proxy. The installer never writes one, a hand edit can; so
+# nothing starts unless the address and ports are what the installer would write.
+if ! [[ "${BIND:-}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+  log "BIND='${BIND:-}' in /etc/default/vps-psiphon is not an IPv4 address — refusing to publish the proxy"
+  exit 1
+fi
+for p in "$SOCKS_PORT" "$HTTP_PORT"; do
+  [[ "$p" =~ ^[0-9]{1,5}$ ]] || { log "port '$p' in /etc/default/vps-psiphon is not a number — refusing to start"; exit 1; }
+done
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 IMG="$(img_canon "$IMAGE")"
-log() { printf 'vps-psiphon-run: %s\n' "$*" >&2; }
 
 cfg="${CONF_DIR}/psiphon.config"
 # Nothing in this part may stop the tunnel from starting: every step is checked, and a
@@ -1044,8 +1054,11 @@ cfg="${CONF_DIR}/psiphon.config"
 # from the next start. EgressRegion is written even when empty: the template says SG,
 # and the image replaces it only when a region is set, so "auto" used to mean Singapore.
 seed_config() {
+  rm -rf "$cfg.new" 2>/dev/null
   docker run --rm --entrypoint cat "$IMG" /etc/psiphon/psiphon.config > "$cfg.new" 2>/dev/null || return 1
   grep -q '"LocalSocksProxyPort"' "$cfg.new" || return 1
+  # A template cut short is not a config: its last line must close the object.
+  [ "$(grep -v '^[[:space:]]*$' "$cfg.new" | tail -1 | tr -d '[:space:]')" = "}" ] || return 1
   sed -i -E \
     -e "s/\"LocalHttpProxyPort\"[[:space:]]*:[[:space:]]*[0-9]+/\"LocalHttpProxyPort\": ${HTTP_PORT}/" \
     -e "s/\"LocalSocksProxyPort\"[[:space:]]*:[[:space:]]*[0-9]+/\"LocalSocksProxyPort\": ${SOCKS_PORT}/" \
@@ -1054,13 +1067,23 @@ seed_config() {
   if [ -n "${DEVICE_REGION:-}" ]; then
     sed -i -E "s/\"DeviceRegion\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"DeviceRegion\": \"${DEVICE_REGION}\"/" "$cfg.new" || return 1
   fi
+  if command -v jq >/dev/null 2>&1; then jq -e . "$cfg.new" >/dev/null 2>&1 || return 1; fi
   chown 1000:1000 "$cfg.new" 2>/dev/null || true
   mv "$cfg.new" "$cfg" || return 1
 }
+# A config that is not JSON at all stops Psiphon on every start, and the image never
+# rewrites a file that exists. Where jq can tell, such a file is moved aside (kept, for
+# whoever wants to see it) and seeded afresh; the server list lives in the datastore, not
+# here, so nothing is lost.
+if [ -f "$cfg" ] && command -v jq >/dev/null 2>&1 && ! jq -e . "$cfg" >/dev/null 2>&1; then
+  if mv -f "$cfg" "$cfg.broken" 2>/dev/null; then
+    log "psiphon.config was not valid JSON — moved to psiphon.config.broken, seeding a fresh one"
+  fi
+fi
 if [ ! -f "$cfg" ]; then
   seed_config || log "could not seed psiphon.config from the image — the image seeds it during this start"
 fi
-rm -f "$cfg.new"
+rm -rf "$cfg.new" 2>/dev/null || true
 
 # Psiphon's servers send every client tactics: settings for the client's network,
 # applied on top of this file. They put in-proxy first: the first dials of every tunnel
@@ -1086,6 +1109,7 @@ rm -f "$cfg.new"
 mode=psiphon-default
 [ "${EXCLUDE_INPROXY:-1}" = 1 ] && mode=no-inproxy
 edit_config() {
+  rm -rf "$cfg.edit" 2>/dev/null
   cp "$cfg" "$cfg.edit" || return 1
   sed -i -E -e '/^ "DisableTactics": (true|false),$/d' \
             -e '/^ "LimitTunnelProtocols": \[[^]]*\],$/d' "$cfg.edit" || return 1
@@ -1103,9 +1127,14 @@ edit_config() {
 }
 if [ -f "$cfg" ]; then
   if ! edit_config; then
-    rm -f "$cfg.edit"
+    rm -rf "$cfg.edit" 2>/dev/null || true
     mode=unedited
-    log "psiphon.config is not in the shape this launcher edits — started as the image wrote it, in-proxy NOT excluded"
+    log "could not edit psiphon.config (not in the shape this launcher edits, or a step failed) — started as it is, in-proxy NOT excluded"
+  elif [ "$mode" = no-inproxy ] && grep -qE '"DisableTactics"[[:space:]]*:[[:space:]]*false' "$cfg"; then
+    # Written by hand in another form, and left alone — but a later key wins in Go's
+    # JSON, so tactics are on and in-proxy is not kept out; reported, not overruled.
+    mode=overridden
+    log "psiphon.config sets \"DisableTactics\": false itself — tactics stay on, in-proxy NOT excluded"
   fi
 elif [ "$mode" = no-inproxy ]; then
   # The image seeds the file during this start; the setting applies from the next.
@@ -1222,7 +1251,7 @@ fi
 
 code="$("${G[@]}" --max-time 30 -o "$d/app" -D "$d/head" -w '%{http_code}' https://gemini.google.com/app 2>/dev/null || true)"
 if [ "$imp" = 1 ] && [ "$code" = 302 ] &&
-   grep -qiE '^location: *https://[^/]*google\.[a-z.]+/sorry/' "$d/head" 2>/dev/null; then
+   grep -qiE '^location: *https://([a-z0-9-]+\.)*google\.[a-z]{2,3}(\.[a-z]{2})?/sorry/' "$d/head" 2>/dev/null; then
   echo "CAPTCHA — Google sends a browser on this exit to /sorry, Gemini not asked"; exit 3
 fi
 bl="$(grep -oE '"cfb2h":"[^"]+"' "$d/app" 2>/dev/null | head -1 | cut -d'"' -f4)"
@@ -1293,8 +1322,8 @@ said="$(grep -oE 'rc_[0-9a-f]+\\",\[\\"[^"\\]{1,60}' "$d/out" 2>/dev/null | tail
 # A reply that reads like a refusal in words is not counted as served: Gemini's refusal
 # is error 1060, and a worded one is a form this check does not know, so it settles
 # nothing — and leaves the stale-check alert armed — rather than passing as ok.
-case "$said" in
-  *[Nn]"ot available"*|*"available in your"*|*[Uu]"navailable"*|*"your region"*|*"your country"*)
+case "$(printf '%s' "$said" | tr '[:upper:]' '[:lower:]')" in
+  *"not available"*|*"available in your"*|*unavailable*|*"your region"*|*"your country"*)
     echo "inconclusive (a reply that reads like a refusal: \"$said…\")$note"; exit 2 ;;
 esac
 [ -n "$said" ] && { echo "ok — Gemini replies (\"$said…\"), naming no place$note"; exit 0; }
@@ -1389,20 +1418,36 @@ refused_seen=""; tunnel=""; futile=0; backoff_seen=0; gem_streak=0; gem_stale_se
 imp_missing_seen=0; run_mode_seen=""
 # shellcheck source=/dev/null
 [ -r "$STATE" ] && . "$STATE"
-# Counters come back from a file; anything but a number starts from zero instead of
-# breaking the arithmetic below.
+# Everything comes back from a file that is sourced, and goes back into it. Each value
+# is held to the form this script writes, or starts over: a counter is a plain decimal
+# of at most 12 digits (a leading zero would read as octal, "08" as an error, and a huge
+# one would overflow into a cooldown that never ends); a flag is 0 or 1; the window is
+# a string of 0s and 1s. Nothing else is carried forward, so a bad value cannot repeat.
 for v in fails last_rotate rotations futile gem_streak; do
-  case "${!v}" in ''|*[!0-9]*) printf -v "$v" 0 ;; esac
+  if [[ "${!v}" =~ ^[0-9]{1,12}$ ]]; then printf -v "$v" '%s' "$((10#${!v}))"; else printf -v "$v" 0; fi
 done
+for v in captcha backoff_seen gem_stale_seen imp_missing_seen; do
+  case "${!v}" in 0|1) : ;; *) printf -v "$v" 0 ;; esac
+done
+[[ "$window" =~ ^[01]{0,64}$ ]] || window=""
+[[ "$denied_gl" =~ ^([A-Z]{2})?$ ]] || denied_gl=""
+# A last rotation in the future — the clock stepped back, say — would hold every
+# rotation until the clock caught up; counted from now instead, it holds one cooldown.
+[ "$last_rotate" -gt "$(date +%s)" ] && last_rotate="$(date +%s)"
+# Tuning from the env file, held to sane numbers: a threshold of 0 would rotate a
+# healthy tunnel at every cooldown.
+[[ "${FAIL_THRESHOLD:-}" =~ ^[0-9]{1,3}$ ]] && [ "$((10#$FAIL_THRESHOLD))" -ge 1 ] && FAIL_THRESHOLD=$((10#$FAIL_THRESHOLD)) || FAIL_THRESHOLD=2
+[[ "${FAIL_WINDOW:-}" =~ ^[0-9]{1,2}$ ]] && [ "$((10#$FAIL_WINDOW))" -ge 1 ] && FAIL_WINDOW=$((10#$FAIL_WINDOW)) || FAIL_WINDOW=5
+[[ "${GEMINI_STALE_CHECKS:-}" =~ ^[0-9]{1,4}$ ]] && [ "$((10#$GEMINI_STALE_CHECKS))" -ge 1 ] && GEMINI_STALE_CHECKS=$((10#$GEMINI_STALE_CHECKS)) || GEMINI_STALE_CHECKS=18
 
 # %q: the reason carries spaces, quotes and parentheses, and this file is sourced.
 save_state() {
   {
-    printf 'fails=%s\nlast_rotate=%s\ncaptcha=%s\nwindow=%s\nrotations=%s\n' \
+    printf 'fails=%q\nlast_rotate=%q\ncaptcha=%q\nwindow=%q\nrotations=%q\n' \
       "$fails" "$last_rotate" "$captcha" "$window" "$rotations"
-    printf 'last_reason=%q\ndenied_gl=%s\nrefused_seen=%q\ntunnel=%q\nfutile=%s\nbackoff_seen=%s\n' \
+    printf 'last_reason=%q\ndenied_gl=%q\nrefused_seen=%q\ntunnel=%q\nfutile=%q\nbackoff_seen=%q\n' \
       "$last_reason" "$denied_gl" "$refused_seen" "$this_tunnel" "$futile" "$backoff_seen"
-    printf 'gem_streak=%s\ngem_stale_seen=%s\nimp_missing_seen=%s\nrun_mode_seen=%q\n' \
+    printf 'gem_streak=%q\ngem_stale_seen=%q\nimp_missing_seen=%q\nrun_mode_seen=%q\n' \
       "$gem_streak" "$gem_stale_seen" "$imp_missing_seen" "$run_mode_seen"
   } > "$STATE"
 }
@@ -1418,6 +1463,9 @@ DB="${CONF_DIR:-/opt/vps-psiphon/config}/ca.psiphon.PsiphonTunnel.tunnel-core/da
 log_tunnels() {
   local last="" max ts proto ns
   [ -r "$SEEN" ] && last="$(cat "$SEEN" 2>/dev/null)"
+  # Nanoseconds since 1970 are 19 digits; anything longer would overflow, and a leading
+  # zero would read as octal. Either starts over from the container's start.
+  if [[ "$last" =~ ^[1-9][0-9]{0,18}$ ]]; then last=$((10#$last)); else last=""; fi
   if ! [[ "$last" =~ ^[0-9]+$ ]]; then
     # No container, no start time: `date -d ""` would read as midnight and log the day.
     last="$(docker inspect -f '{{.State.StartedAt}}' "${NAME:-vps-psiphon}" 2>/dev/null)"
@@ -1430,7 +1478,7 @@ log_tunnels() {
   max="$last"
   # Times carry nanoseconds of varying length, so they are compared as numbers.
   while read -r ns proto ts; do
-    [[ "$ns" =~ ^[0-9]+$ ]] || continue
+    [[ "$ns" =~ ^[1-9][0-9]{0,18}$ ]] || continue
     [ "$ns" -gt "$last" ] || continue
     log "tunnel up: $proto (dialled at $ts)"
     [ "$ns" -gt "$max" ] && max="$ns"
@@ -1622,6 +1670,7 @@ fi
 decisive=0; gem=""; grc=""
 if [ "${GEMINI_CHECK:-1}" = 1 ] && [ "$alive" = 1 ] && [ "${ytcode:-000}" != 000 ]; then
   gem="$(timeout 200 /usr/local/sbin/vps-psiphon-gemini-check 2>/dev/null)"; grc=$?
+  gem="${gem%%$'\n'*}"   # one line into the log, whatever the check printed
   case "$grc" in
     0|1|3) : ;;
     124) grc=2; gem="inconclusive (the check ran past 200 s and was stopped)" ;;
@@ -1650,7 +1699,10 @@ if [ "${GEMINI_CHECK:-1}" = 1 ] && [ "$alive" = 1 ] && [ "${ytcode:-000}" != 000
     gem_streak=0; gem_stale_seen=0
   fi
   # A build asked for and missing (a re-run could not fetch one) is said once.
-  if [ "${IMPERSONATE:-0}" = 1 ] && [ ! -x /opt/vps-psiphon/curl-impersonate/curl-impersonate ]; then
+  # A build without a curl_chromeN wrapper watches nothing either: the check then goes by
+  # plain curl, exactly as with no build.
+  if [ "${IMPERSONATE:-0}" = 1 ] && { [ ! -x /opt/vps-psiphon/curl-impersonate/curl-impersonate ] ||
+       [ -z "$(find /opt/vps-psiphon/curl-impersonate -maxdepth 1 -regex '.*/curl_chrome[0-9]+' -print -quit 2>/dev/null)" ]; }; then
     [ "$imp_missing_seen" = 0 ] \
       && notify "IMPERSONATE=1, but no curl-impersonate build is installed: the browser captcha is not watched. Re-run the installer to fetch one."
     imp_missing_seen=1
@@ -1700,8 +1752,8 @@ ones="${window//0/}"; fails="${#ones}"
 # refusing the whole pool, an upstream outage, a check gone stale — would otherwise drop
 # every live connection on every cooldown, forever.
 cool="${ROTATE_COOLDOWN:-1800}"; cap="${ROTATE_COOLDOWN_MAX:-7200}"
-case "$cool" in ''|*[!0-9]*) cool=1800 ;; esac
-case "$cap" in ''|*[!0-9]*) cap=7200 ;; esac
+if [[ "$cool" =~ ^[0-9]{1,7}$ ]]; then cool=$((10#$cool)); else cool=1800; fi
+if [[ "$cap" =~ ^[0-9]{1,7}$ ]]; then cap=$((10#$cap)); else cap=7200; fi
 [ "$cap" -lt "$cool" ] && cap="$cool"
 cooldown_after() {
   local c="$cool" k="$1"
@@ -1981,6 +2033,7 @@ status() {
     no-inproxy)      echo "protocols : in-proxy excluded (tactics off)" ;;
     pending)         echo "protocols : in-proxy exclusion applies from the next start (the image seeded the config on this one)" ;;
     unedited)        echo "protocols : in-proxy NOT excluded — psiphon.config is not in the shape the launcher edits (journalctl -u vps-psiphon)" ;;
+    overridden)      echo "protocols : in-proxy NOT excluded — psiphon.config sets \"DisableTactics\": false by hand" ;;
     psiphon-default) echo "protocols : Psiphon's own choice (--inproxy)" ;;
   esac
   v="$(grep ' tunnel up: ' /var/log/vps-psiphon-watchdog.log 2>/dev/null | tail -1)"

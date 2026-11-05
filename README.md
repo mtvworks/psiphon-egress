@@ -182,6 +182,11 @@ shows. `--inproxy` lets Psiphon choose again.
 Nothing the launcher edits can keep the tunnel from starting: every step is
 checked, and a config it cannot read in the shape it knows is left as the image
 wrote it — `status` then says in-proxy is not excluded, and one alert goes out.
+A config that is not JSON at all (Psiphon would stop on it at every start) is
+moved to `psiphon.config.broken` and seeded afresh. The one thing the launcher
+refuses is an address or port the installer would not write: an empty `BIND`
+in a hand-edited env file would publish the SOCKS on every interface — an open
+proxy — so it does not start at all.
 A fresh config also gets `"EgressRegion": ""` for auto: the image's template
 says `SG` and replaces it only when a region is set, so auto used to mean
 Singapore.
