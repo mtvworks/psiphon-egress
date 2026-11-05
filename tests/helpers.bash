@@ -85,6 +85,7 @@ EOF
 #   FAKE_GEM_HEAD  its response headers          (default: none)
 #   FAKE_GEM_OUT   the answer to the message     (default: a reply placing us in Berlin)
 #   FAKE_CURL_OLD  1: a curl without --parallel and HTTP/2
+#   FAKE_KEEPALIVE_EARLY  1: the keep-alive request ends before the message does
 # Telegram calls are recorded in $STUB_LOG as "TG <text>", probe fetches as "PROBE <url>",
 # the Gemini page as "GEMPAGE <how>" and the message as "GEMMSG parallel=<0|1> <proxy>".
 write_stubs() {
@@ -124,7 +125,11 @@ case "$url" in
     echo "GEMMSG parallel=$par $proxy $url" >> "$STUB_LOG"
     if [ -n "${FAKE_GEM_OUT+x}" ]; then printf '%s' "$FAKE_GEM_OUT" > "$out"
     else printf '%s\n' ')]}'"'" '' '120' '[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],null,null,[[\"rc_1\",[\"Hello!\"]]],[\"Berlin, Germany\",\"SWML_DESCRIPTION_FROM_YOUR_INTERNET_ADDRESS\"]]"]]' > "$out"; fi
+    # The keep-alive request after --next reports when it ended: after the message as
+    # Google does, or first with FAKE_KEEPALIVE_EARLY=1.
+    [ "$par" = 1 ] && [ "${FAKE_KEEPALIVE_EARLY:-0}" = 1 ] && printf '\nkeepalive-done 400 0.4\n' >&2
     [[ "$wfmt" == *'%{stderr}message-done'* ]] && printf 'message-done' >&2
+    [ "$par" = 1 ] && [ "${FAKE_KEEPALIVE_EARLY:-0}" != 1 ] && printf '\nkeepalive-done 400 31.2\n' >&2
     exit 0 ;;
 esac
 case "$url" in

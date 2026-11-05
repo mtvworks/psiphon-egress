@@ -163,19 +163,28 @@ block Psiphon; an exit carries a whole host's traffic, and upstream measured suc
 tunnels dying within minutes or crawling at a few hundred KB/s, while direct ones
 carried megabytes a second for hours.
 
-So the launcher writes `"DisableTactics": true` and a `LimitTunnelProtocols`
-list without the three `INPROXY-WEBRTC` protocols into `psiphon.config` at every
-start (seeding the file from the image first, so even the first tunnel after an
-install gets it). The watchdog logs every tunnel the client brings up with its
-protocol — `tunnel up: QUIC-OSSH (connected at …)` — which is where the
-exclusion shows. `--inproxy` lets Psiphon choose again.
+So the launcher writes `"DisableTactics": true` into `psiphon.config` at every
+start, seeding the file from the image first so that even the first tunnel after
+an install gets it. That alone keeps in-proxy out: tunnel-core disables every
+`INPROXY-WEBRTC` protocol by default, never picks a default-disabled one without
+a protocol limit, and only tactics can enable them — with tactics off it applies
+none, not even stored ones.
 
-**Safe mode.** Psiphon refuses to start on a protocol name its build does not
-know, so an image newer or older than that list would loop on a dead tunnel.
-After three restarts in a row that each come less than 90 s after the previous
-one, the launcher starts without its settings — Psiphon's defaults — and says so
-in the journal, in `vps-psiphon status` and in one alert. A start that lives
-past 90 s ends the streak, so a crash with another cause leaves nothing behind.
+Upstream also writes a `LimitTunnelProtocols` list. It names exactly the
+default-enabled protocols, so it adds nothing, and it is the one setting that
+can stop the client from starting: tunnel-core refuses a protocol name its build
+does not know, and an image newer or older than the list would loop on a dead
+tunnel. It is not written here (a list in the one-line form upstream writes is
+removed). The watchdog logs every tunnel the client brings up with its
+protocol — `tunnel up: QUIC-OSSH (dialled at …)` — which is where the exclusion
+shows. `--inproxy` lets Psiphon choose again.
+
+Nothing the launcher edits can keep the tunnel from starting: every step is
+checked, and a config it cannot read in the shape it knows is left as the image
+wrote it — `status` then says in-proxy is not excluded, and one alert goes out.
+A fresh config also gets `"EgressRegion": ""` for auto: the image's template
+says `SG` and replaces it only when a region is set, so auto used to mean
+Singapore.
 
 ## When rotations do not help
 
@@ -270,7 +279,7 @@ Both are off unless configured.
   time an exit is seen in a denied country or refused by a target, and when a
   rotation did not bring the tunnel back; once each when rotations start backing
   off, when the Gemini check has settled nothing for three hours, when the
-  launcher enters safe mode, and when `--impersonate` is on without a build. Alerts go directly, not through the tunnel. The token is kept in
+  launcher could not edit `psiphon.config`, and when `--impersonate` is on without a build. Alerts go directly, not through the tunnel. The token is kept in
   `/etc/default/vps-psiphon` (mode 0600) and never passed on a command line.
   `vps-psiphon notify-test` checks the setup.
 - **Prometheus**: if `/var/lib/node_exporter/textfile_collector` exists (or
@@ -282,7 +291,7 @@ Both are off unless configured.
   `vps_psiphon_country_info{gl="XX"}`, `vps_psiphon_last_check_timestamp_seconds`,
   `vps_psiphon_gemini_result` (0 ok, 1 refused, 2 inconclusive, 3 captcha),
   `vps_psiphon_gemini_inconclusive_streak`, `vps_psiphon_rotation_cooldown_seconds`,
-  `vps_psiphon_safe_mode`.
+  `vps_psiphon_inproxy_excluded`.
 
 The watchdog log is rotated weekly through `/etc/logrotate.d/vps-psiphon`.
 
@@ -299,7 +308,7 @@ The watchdog log is rotated weekly through `/etc/logrotate.d/vps-psiphon`.
 | **Watchdog fixes** | a timed-out transfer is judged as slow, not as a dead tunnel; `status` applies the deny-list like the watchdog does; one lock for the watchdog and manual commands. |
 | **Target checks** | the services the exit is for (`PROBE_URLS`) are fetched through it; a 403/451 rotates — Google refuses single exits per service while the other checks read green. |
 | **From upstream 1.2** | the Gemini check with the 1060 refusal and the held-open answer, `--impersonate`, the in-proxy exclusion with tactics off, failures counted per tunnel — see the sections above, and [CREDITS.md](CREDITS.md). |
-| **Fault tolerance around them** | a reply without a place counts as served; an older curl degrades the check instead of breaking it; a stale Gemini check alerts; the launcher's safe mode; back-off for futile rotations; a reinstall is not blocked by a curl-impersonate download it did not ask for; the watchdog unit is cut off after 15 min instead of hanging its timer. |
+| **Fault tolerance around them** | a reply without a place counts as served; an older curl degrades the check instead of breaking it; a stale Gemini check alerts; in-proxy kept out by tactics off alone, without the protocol list that can stop the client; the launcher never fails a start over its own edits; back-off for futile rotations; curl-impersonate installed root-owned whatever the archive says; a reinstall is not blocked by a curl-impersonate download it did not ask for; the watchdog unit is cut off after 15 min instead of hanging its timer. |
 | **`update-image`, alerts, metrics** | moving the digest pin in the open; Telegram alerts; node_exporter metrics; log rotation. |
 | **Tests and CI** | `bats tests` and `tests/lint.sh` (shellcheck, generated scripts included) run on every push. |
 

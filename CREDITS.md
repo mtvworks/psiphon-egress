@@ -31,16 +31,18 @@ the author's measurements quoted in the comments where they justify a choice:
   request on the same HTTP/2 connection (1.1);
 - **`--impersonate`** (1.2): the captcha Google shows browsers alone on an exit,
   caught by fetching the page with curl-impersonate, with a pinned fallback release;
-- **tactics off and in-proxy excluded** from the tunnel protocols (1.0), and the
-  tunnel-protocol log read from the client's datastore;
+- **tactics off**, which keeps in-proxy out (1.0), and the tunnel-protocol log read
+  from the client's datastore — but not upstream's `LimitTunnelProtocols` list, which
+  names only the default-enabled protocols and is the one setting that can stop the
+  client from starting;
 - **failures belong to the tunnel they were counted on**, and a check during which
   the tunnel restarted is not judged.
 
 What we changed in them, and why, is in the README ("Asking Gemini itself", "In-proxy
 and Psiphon's tactics", "When rotations do not help"): a reply without a place counts
 as served (measured), an older curl degrades the check instead of breaking it, a
-stale check alerts, the launcher falls back to Psiphon's defaults after quick deaths,
-and futile rotations back off.
+stale check alerts, the launcher never fails a start over its own edits, and futile
+rotations back off.
 
 ## Hardening ideas — [DenFiord/remnascripts](https://github.com/DenFiord/remnascripts) (MIT)
 

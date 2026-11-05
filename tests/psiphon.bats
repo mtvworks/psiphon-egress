@@ -434,7 +434,7 @@ put_shared_funcs '$f'"
 }
 
 @test "installer takes the lock before it reads or writes the old settings" {
-  lock="$(grep -n '^flock -w 300 9 ' "$INSTALLER" | cut -d: -f1)"
+  lock="$(grep -nE '^flock -w [0-9]+ 9 ' "$INSTALLER" | cut -d: -f1)"
   first_read="$(grep -n '"\$ENVF"' "$INSTALLER" | head -1 | cut -d: -f1)"
   restart="$(grep -n '^systemctl restart vps-psiphon.service' "$INSTALLER" | cut -d: -f1)"
   [ -n "$lock" ] && [ -n "$first_read" ] && [ -n "$restart" ]
@@ -505,6 +505,21 @@ GEM_ERROR_REPLY='[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],{\"11\":[\"Technical E
   # Session fields that are not plain tokens are not spliced into a URL.
   FAKE_GEM_PAGE='"FdrFJe":"1&x=y","cfb2h":"boq"' run_gem
   [ "$status" -eq 2 ] && [[ "$output" == *"not in the form this check knows"* ]]
+}
+
+@test "gemini: a worded refusal is not counted as served" {
+  FAKE_GEM_OUT='[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],null,null,[[\"rc_ab12\",[\"Gemini is not available in your country.\"]]]]"]]' run_gem
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"reads like a refusal"* ]]
+}
+
+@test "gemini: a keep-alive request that ends before the answer is named" {
+  FAKE_KEEPALIVE_EARLY=1 FAKE_GEM_OUT='' run_gem
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"keep-alive request ended before the answer: HTTP 400 after 0.4s"* ]]
+  # In the normal order it ends after the message, and nothing is said.
+  run_gem
+  [ "$status" -eq 0 ] && [[ "$output" != *keep-alive* ]]
 }
 
 @test "gemini: a curl without --parallel sends the message alone and says what that costs" {
@@ -617,7 +632,8 @@ GEM_ERROR_REPLY='[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],{\"11\":[\"Technical E
   [ "$status" -eq 0 ]
   wd_log | grep -q 'check not judged: the tunnel restarted during it (it read: gemini-refused'
   refute grep -q 'systemctl restart' "$STUB_LOG"
-  [ ! -e "$ROOT/var/lib/vps-psiphon-watchdog.state" ]
+  # Nothing counted: the window is as it was (empty).
+  grep -q '^window=$' "$ROOT/var/lib/vps-psiphon-watchdog.state"
 }
 
 @test "watchdog: rotations that keep not helping back off, and a passing check ends it" {
@@ -647,16 +663,6 @@ GEM_ERROR_REPLY='[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],{\"11\":[\"Technical E
   grep -qx 'vps_psiphon_rotation_cooldown_seconds 5000' "$ROOT/metrics/vps-psiphon.prom"
 }
 
-@test "watchdog: launcher safe mode is logged, alerted once and exported" {
-  echo "$(date +%s) 3 safe-mode" > "$ROOT/var/lib/vps-psiphon-run.state"
-  run_watchdog; run_watchdog
-  [ "$(grep -c '^TG .*safe mode' "$STUB_LOG")" -eq 1 ]
-  grep -qx 'vps_psiphon_safe_mode 1' "$ROOT/metrics/vps-psiphon.prom"
-  echo "$(date +%s) 0 no-inproxy" > "$ROOT/var/lib/vps-psiphon-run.state"
-  run_watchdog
-  wd_log | grep -q 'launcher left safe mode (no-inproxy)'
-  grep -qx 'vps_psiphon_safe_mode 0' "$ROOT/metrics/vps-psiphon.prom"
-}
 
 @test "watchdog: each tunnel the client brings up is logged once, with its protocol" {
   db="$ROOT/config/ca.psiphon.PsiphonTunnel.tunnel-core/datastore"
@@ -673,7 +679,37 @@ GEM_ERROR_REPLY='[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],{\"11\":[\"Technical E
 
 # ---------------------------------------------------------------- launcher --
 
-@test "launcher: seeds the config from the image and keeps in-proxy out, once" {
+
+
+
+
+@test "watchdog: a config the launcher could not edit is alerted once and exported" {
+  echo "$(date +%s) unedited" > "$ROOT/var/lib/vps-psiphon-run.state"
+  run_watchdog; run_watchdog
+  [ "$(grep -c '^TG .*in-proxy is NOT kept out' "$STUB_LOG")" -eq 1 ]
+  grep -qx 'vps_psiphon_inproxy_excluded 0' "$ROOT/metrics/vps-psiphon.prom"
+  echo "$(date +%s) no-inproxy" > "$ROOT/var/lib/vps-psiphon-run.state"
+  run_watchdog
+  grep -qx 'vps_psiphon_inproxy_excluded 1' "$ROOT/metrics/vps-psiphon.prom"
+}
+
+@test "watchdog: a check not judged still keeps its once-only alerts sent" {
+  echo "$(date +%s) unedited" > "$ROOT/var/lib/vps-psiphon-run.state"
+  seq_f="$ROOT/started.seq"
+  printf '2026-11-05T10:00:00Z\n2026-11-05T10:00:00Z\n2026-11-05T10:05:00Z\n' > "$seq_f"
+  FAKE_STARTED_SEQ="$seq_f" run_watchdog
+  wd_log | grep -q 'check not judged'
+  # Saved under the tunnel the check began on: the next check sees a new one.
+  grep -q "^tunnel=2026-11-05T10:00:00Z$" "$ROOT/var/lib/vps-psiphon-watchdog.state"
+  FAKE_STARTED=2026-11-05T10:05:00Z run_watchdog
+  [ "$(grep -c '^TG .*in-proxy is NOT kept out' "$STUB_LOG")" -eq 1 ]
+}
+
+# ---------------------------------------------------------------- launcher --
+
+launcher_mode() { awk '{print $2}' "$ROOT/var/lib/vps-psiphon-run.state"; }
+
+@test "launcher: seeds the config from the image and turns tactics off, once" {
   t="$ROOT/template.json"; psiphon_template > "$t"
   FAKE_TEMPLATE="$t" run_launcher
   [ "$status" -eq 0 ]
@@ -683,61 +719,76 @@ GEM_ERROR_REPLY='[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],{\"11\":[\"Technical E
   grep -q '"EgressRegion": "DE"' "$c"
   grep -q '"DeviceRegion": "DE"' "$c"
   [ "$(grep -c '"DisableTactics": true' "$c")" -eq 1 ]
-  [ "$(grep -c '"LimitTunnelProtocols"' "$c")" -eq 1 ]
-  refute grep -q INPROXY "$c"
-  jq -e '.DisableTactics == true and (.LimitTunnelProtocols | length) == 10' "$c"
-  [ "$(awk '{print $3}' "$ROOT/var/lib/vps-psiphon-run.state")" = no-inproxy ]
+  # No protocol list: it adds nothing to tactics off, and a name the build does not
+  # know would stop the client from starting.
+  refute grep -q LimitTunnelProtocols "$c"
+  jq -e '.DisableTactics == true and .UseIndistinguishableTLS == true' "$c"
+  [ "$(launcher_mode)" = no-inproxy ]
   grep -q '^docker run --rm --name vps-psiphon .* repo/psiphon@sha256:0123$' "$STUB_LOG"
-  # Started again a while later: still one line each, and valid JSON.
-  sed -i "s/^[0-9]* /$(( $(date +%s) - 3600 )) /" "$ROOT/var/lib/vps-psiphon-run.state"
-  run_launcher
+  # Every start after: still one line, the file not rewritten.
+  before="$(stat -c %i "$c")"
+  run_launcher; run_launcher
   [ "$(grep -c '"DisableTactics"' "$c")" -eq 1 ]
-  [ "$(grep -c '"LimitTunnelProtocols"' "$c")" -eq 1 ]
+  [ "$(stat -c %i "$c")" = "$before" ]
   jq -e . "$c" >/dev/null
 }
 
-@test "launcher: three quick deaths in a row start Psiphon without its settings" {
-  psiphon_template > "$ROOT/config/psiphon.config"
-  c="$ROOT/config/psiphon.config"
-  for _ in 1 2 3; do run_launcher; done
-  [ "$(awk '{print $2, $3}' "$ROOT/var/lib/vps-psiphon-run.state")" = "2 no-inproxy" ]
-  grep -q '"DisableTactics"' "$c"
-  run_launcher
-  [[ "$output" == *"safe mode: 3 quick restarts"* ]]
-  [ "$(awk '{print $3}' "$ROOT/var/lib/vps-psiphon-run.state")" = safe-mode ]
-  refute grep -q '"DisableTactics"\|"LimitTunnelProtocols"' "$c"
-  jq -e . "$c" >/dev/null
-  # A start that lived past 90 s ends the streak: the settings come back.
-  sed -i "s/^[0-9]* /$(( $(date +%s) - 600 )) /" "$ROOT/var/lib/vps-psiphon-run.state"
-  run_launcher
-  [ "$(awk '{print $2, $3}' "$ROOT/var/lib/vps-psiphon-run.state")" = "0 no-inproxy" ]
-  grep -q '"DisableTactics": true' "$c"
+@test "launcher: auto is seeded as no region, not as the template's SG" {
+  t="$ROOT/template.json"; psiphon_template > "$t"
+  sed -i 's/^EGRESS_REGION=.*/EGRESS_REGION=/' "$ROOT/etc/default/vps-psiphon"
+  FAKE_TEMPLATE="$t" run_launcher
+  grep -q '"EgressRegion": ""' "$ROOT/config/psiphon.config"
 }
 
-@test "launcher: --inproxy takes the settings out; a config it cannot read is left alone" {
+@test "launcher: --inproxy takes its line out and leaves the image's config as it was" {
   psiphon_template > "$ROOT/config/psiphon.config"
   c="$ROOT/config/psiphon.config"
   run_launcher
   grep -q '"DisableTactics"' "$c"
   echo EXCLUDE_INPROXY=0 >> "$ROOT/etc/default/vps-psiphon"
-  sed -i "s/^[0-9]* /$(( $(date +%s) - 600 )) /" "$ROOT/var/lib/vps-psiphon-run.state"
   run_launcher
-  refute grep -q '"DisableTactics"\|"LimitTunnelProtocols"' "$c"
-  [ "$(awk '{print $3}' "$ROOT/var/lib/vps-psiphon-run.state")" = psiphon-default ]
+  [ "$(launcher_mode)" = psiphon-default ]
   diff <(psiphon_template) "$c"
-  sed -i 's/^EXCLUDE_INPROXY=0$/EXCLUDE_INPROXY=1/' "$ROOT/etc/default/vps-psiphon"
-  printf '{"weird": true}\n' > "$c"
-  run_launcher
-  [[ "$output" == *"not in the shape this launcher edits"* ]]
-  [ "$(cat "$c")" = '{"weird": true}' ]
-  [ "$(awk '{print $3}' "$ROOT/var/lib/vps-psiphon-run.state")" = unedited ]
 }
 
-@test "launcher: no template to seed from leaves the settings for the next start" {
+@test "launcher: a protocol list in its own (or upstream's) form is removed, a hand-written one is not" {
+  c="$ROOT/config/psiphon.config"
+  # The form this launcher and upstream's wrote: one line, one space of indent.
+  { echo '{'; echo ' "LimitTunnelProtocols": ["SSH", "OSSH"],'; echo ' "DisableTactics": true,'; psiphon_template | sed 1d; } > "$c"
+  run_launcher
+  refute grep -q LimitTunnelProtocols "$c"
+  [ "$(grep -c '"DisableTactics"' "$c")" -eq 1 ]
+  jq -e . "$c" >/dev/null
+  # Written by hand over several lines: not the launcher's, left whole — the file stays JSON.
+  { echo '{'; echo '  "LimitTunnelProtocols": ['; echo '    "OSSH",'; echo '    "QUIC-OSSH"'; echo '  ],'; psiphon_template | sed 1d; } > "$c"
+  run_launcher
+  jq -e '.LimitTunnelProtocols == ["OSSH", "QUIC-OSSH"] and .DisableTactics == true' "$c"
+}
+
+@test "launcher: a config it cannot read, or cannot edit, is left alone and the tunnel still starts" {
+  c="$ROOT/config/psiphon.config"
+  printf '{"weird": true}\n' > "$c"
+  run_launcher
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"not in the shape this launcher edits"* ]]
+  [ "$(cat "$c")" = '{"weird": true}' ]
+  [ "$(launcher_mode)" = unedited ]
+  grep -q '^docker run --rm --name vps-psiphon ' "$STUB_LOG"
+  # A failing edit (here: cp cannot write next to the config) does not stop the start.
+  psiphon_template > "$c"
+  mkdir -p "$ROOT/bin2"; printf '#!/bin/sh\nexit 1\n' > "$ROOT/bin2/cp"; chmod +x "$ROOT/bin2/cp"
+  : > "$STUB_LOG"
+  PATH="$ROOT/bin2:$PATH" run_launcher
+  [ "$status" -eq 0 ]
+  [ "$(launcher_mode)" = unedited ]
+  grep -q '^docker run --rm --name vps-psiphon ' "$STUB_LOG"
+}
+
+@test "launcher: no template to seed from leaves the setting for the next start" {
   run_launcher
   [ "$status" -eq 0 ]
   [ ! -e "$ROOT/config/psiphon.config" ]
-  [ "$(awk '{print $3}' "$ROOT/var/lib/vps-psiphon-run.state")" = pending ]
+  [ "$(launcher_mode)" = pending ]
   grep -q '^docker run --rm --name vps-psiphon ' "$STUB_LOG"
 }
 
@@ -852,6 +903,43 @@ C
   [ "$status" -eq 1 ]
   [[ "$output" == *"holds no working curl-impersonate with a Chrome profile"* ]]
   [ ! -e "$CI_DIR" ]
+}
+
+@test "impersonate: the build is root's alone, whatever owner and mode the archive carries" {
+  impersonate_env
+  # As the v2.3.2 assets are: files of uid 1001; and group/other-writable for good measure.
+  mkdir -p "$W/rel/y"; tar -xzf "$W/rel/good.tar.gz" -C "$W/rel/y"
+  tar --owner=1001 --group=1001 --mode=0777 -czf "$W/rel/foreign.tar.gz" -C "$W/rel/y" .
+  sum="$(sha256sum "$W/rel/foreign.tar.gz" | cut -d' ' -f1)"
+  FAKE_REL_TAG=v9.9.9 FAKE_REL_SUM="$sum" FAKE_REL_FILE="$W/rel/foreign.tar.gz" run impersonate_install
+  [ "$status" -eq 0 ]
+  [ -z "$(find "$CI_DIR" -perm /022 -print -quit)" ]
+  if [ "$(id -u)" = 0 ]; then [ -z "$(find "$CI_DIR" ! -uid 0 -print -quit)" ]; fi
+}
+
+@test "impersonate: an archive carrying a link is refused" {
+  impersonate_env
+  mkdir -p "$W/rel/l"; tar -xzf "$W/rel/good.tar.gz" -C "$W/rel/l"; ln -s /etc/passwd "$W/rel/l/evil"
+  tar -czf "$W/rel/link.tar.gz" -C "$W/rel/l" .
+  sum="$(sha256sum "$W/rel/link.tar.gz" | cut -d' ' -f1)"
+  FAKE_REL_TAG=v9.9.9 FAKE_REL_SUM="$sum" FAKE_REL_FILE="$W/rel/link.tar.gz" run impersonate_install
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"could not be unpacked as plain root-owned files"* ]]
+}
+
+@test "impersonate: a swap that fails keeps the installed build and says so" {
+  impersonate_env
+  mkdir -p "$CI_DIR"; echo old > "$CI_DIR/VERSION"
+  sum="$(sha256sum "$W/rel/good.tar.gz" | cut -d' ' -f1)"
+  # mv fails once the new build is to take the old one's place — as on a full /opt.
+  printf '#!/bin/sh\ncase "$1" in *curl-impersonate.new) exit 1 ;; esac\nexec /bin/mv "$@"\n' > "$W/bin/mv"
+  chmod +x "$W/bin/mv"
+  FAKE_REL_TAG=v9.9.9 FAKE_REL_SUM="$sum" FAKE_REL_FILE="$W/rel/good.tar.gz" run impersonate_install
+  rm -f "$W/bin/mv"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"could not put the new build in place"* ]]
+  [ "$(cat "$CI_DIR/VERSION")" = old ]
+  [ ! -e "$CI_DIR.new" ] && [ ! -e "$CI_DIR.old" ]
 }
 
 @test "impersonate: every pinned digest is a sha256" {
