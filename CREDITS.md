@@ -20,6 +20,28 @@ drew exits that Google geolocates to **RU** — on a fast, healthy, perfectly
 reachable tunnel. For anyone running a VPN out of that country, such an exit is
 worse than no tunnel. Liveness probes call it healthy. This watchdog rotated it.
 
+### Ported later from upstream 1.0–1.2 (2026-10-26 … 2026-11-04)
+
+We forked before upstream's Gemini check existed. These came over afterwards, with
+the author's measurements quoted in the comments where they justify a choice:
+
+- the **Gemini check** itself (`vps-psiphon-gemini-check`): asking Gemini, not its
+  page's status code, so that error 1060 is seen at all; the refusal's new frame
+  (1.0.1); holding the answer open past Psiphon's 30 s idle cut with a second
+  request on the same HTTP/2 connection (1.1);
+- **`--impersonate`** (1.2): the captcha Google shows browsers alone on an exit,
+  caught by fetching the page with curl-impersonate, with a pinned fallback release;
+- **tactics off and in-proxy excluded** from the tunnel protocols (1.0), and the
+  tunnel-protocol log read from the client's datastore;
+- **failures belong to the tunnel they were counted on**, and a check during which
+  the tunnel restarted is not judged.
+
+What we changed in them, and why, is in the README ("Asking Gemini itself", "In-proxy
+and Psiphon's tactics", "When rotations do not help"): a reply without a place counts
+as served (measured), an older curl degrades the check instead of breaking it, a
+stale check alerts, the launcher falls back to Psiphon's defaults after quick deaths,
+and futile rotations back off.
+
 ## Hardening ideas — [DenFiord/remnascripts](https://github.com/DenFiord/remnascripts) (MIT)
 
 A markedly more engineered project (bats tests, CI, `SECURITY.md`, a "container
