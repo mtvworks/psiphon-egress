@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Prints one generated script (RUN, ADV, WD, CLI) the way the installer writes it: the
+# Prints one generated script (RUN, ADV, GEM, WD, CLI) the way the installer writes it: the
 # body of its heredoc, with @@SHARED_FUNCS@@ replaced by the installer's own
 # definitions, exactly as put_shared_funcs does. Used by lint.sh and the bats tests.
 set -euo pipefail
 installer="$(cd "$(dirname "$0")/.." && pwd)/psiphon_install.sh"
-tag="${1:?usage: render.sh RUN|ADV|WD|CLI}"
+tag="${1:?usage: render.sh RUN|ADV|GEM|WD|CLI}"
 # The installer defines them at the top level, one copy each.
 eval "$(sed -n '/^cc_list() {/,/^}/p' "$installer")"
 eval "$(sed -n '/^img_repo() /,/^}$/p' "$installer")"
