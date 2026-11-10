@@ -36,7 +36,7 @@ refute() { if "$@"; then echo "expected to fail: $*" >&2; return 1; fi; }
 @test "installer refuses bad input before touching the system" {
   for args in "--region d" "--bind 1.2.3.999" "--bind ::1" "--socks-port 0" \
               "--socks-port 70000" "--memory 1x" "--device-region usa" \
-              "--tg-token nope" "--tg-chat x-y" "--metrics-dir relative/path" \
+              "--tg-token nope" "--tg-chat x-y" "--tg-thread x" "--metrics-dir relative/path" \
               "--accept DE,xyz" "--probe-urls http://plain.example/" \
               "--probe-urls https://x.example/a'b" "--probe-urls https://x.example/\$(id)"; do
     # shellcheck disable=SC2086
@@ -449,6 +449,19 @@ put_shared_funcs '$f'"
   [ "$status" -eq 0 ]
   [ "$output" = sent ]
   grep -q '^TG .*test message' "$STUB_LOG"
+}
+
+@test "cli: notify-test posts into the forum topic when TG_THREAD is set" {
+  sed -i.bak "s/^TG_THREAD=.*/TG_THREAD='10'/" "$ROOT/etc/default/vps-psiphon"
+  run_cli notify-test
+  [ "$status" -eq 0 ]
+  grep -qx 'TGTHREAD 10' "$STUB_LOG"
+}
+
+@test "cli: notify-test sends no topic when TG_THREAD is empty" {
+  run_cli notify-test
+  [ "$status" -eq 0 ]
+  ! grep -q '^TGTHREAD' "$STUB_LOG"
 }
 
 @test "cli: notify-test says so when alerts are off" {

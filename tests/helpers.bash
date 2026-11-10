@@ -62,6 +62,7 @@ REGION_POOL='DE NL'
 ACCEPT_REGIONS=''
 TG_TOKEN='123:abc'
 TG_CHAT='42'
+TG_THREAD=''
 METRICS_DIR='$ROOT/metrics'
 EOF
 }
@@ -91,7 +92,7 @@ while [ $# -gt 0 ]; do
 done
 case "$url" in
   *api.telegram.org*)
-    for d in "${data[@]}"; do case "$d" in text=*) echo "TG ${d#text=}" >> "$STUB_LOG" ;; esac; done
+    for d in "${data[@]}"; do case "$d" in text=*) echo "TG ${d#text=}" >> "$STUB_LOG" ;; message_thread_id=*) echo "TGTHREAD ${d#message_thread_id=}" >> "$STUB_LOG" ;; esac; done
     printf 200 ;;
   *generate_204*) printf '%s' "${FAKE_204:-204}" ;;
   *youtube*)
