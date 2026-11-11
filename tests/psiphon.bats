@@ -505,6 +505,7 @@ GEM_ERROR_REPLY='[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],{\"11\":[\"Technical E
 
 @test "gemini: a message sent to /sorry is told apart from silence, and never a refusal" {
   FAKE_GEM_OUT='<HTML><A HREF="https://www.google.com/sorry/index?continue=x">here</A>' run_gem
+  echo "got: $output"
   [ "$status" -eq 2 ]
   [[ "$output" == "inconclusive (the message was sent to /sorry)" ]]
   # Not Google's own host: only silence.
@@ -1045,6 +1046,9 @@ impersonate_env() {
   tar -czf "$W/rel/nochrome.tar.gz" -C "$W/rel/x" .
   printf '#!/bin/sh\necho x86_64\n' > "$W/bin/uname"
   printf '#!/bin/sh\necho "ldd (GNU libc) 2.39"\n' > "$W/bin/ldd"
+  # CI runs the tests as an ordinary user, who cannot give files to root: chown is a
+  # no-op there, and the one test about ownership needs root and says so.
+  [ "$(id -u)" = 0 ] || printf '#!/bin/sh\nexit 0\n' > "$W/bin/chown"
   cat > "$W/bin/curl" <<'C'
 #!/usr/bin/env bash
 out=""; url=""; w=""
@@ -1124,6 +1128,7 @@ C
 }
 
 @test "impersonate: the build is root's alone, whatever owner and mode the archive carries" {
+  [ "$(id -u)" = 0 ] || skip "needs root to hand files to root"
   impersonate_env
   # As the v2.3.2 assets are: files of uid 1001; and group/other-writable for good measure.
   mkdir -p "$W/rel/y"; tar -xzf "$W/rel/good.tar.gz" -C "$W/rel/y"
