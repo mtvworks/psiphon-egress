@@ -12,5 +12,6 @@ and what an attacker could reach (the SOCKS port, the host, the alert channel).
 
 ## Supported versions
 
-Only the latest commit on `main` gets fixes. Nodes should install the
-installer pinned by commit SHA and verified by sha256, as the README shows.
+Only the latest commit on `main` gets fixes. For production hosts, fetch the
+installer by commit SHA rather than from `main`, and check its sha256 before
+running it.
