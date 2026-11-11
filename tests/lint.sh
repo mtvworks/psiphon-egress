@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-for t in RUN ADV WD CLI; do
+for t in RUN ADV GEM WD CLI; do
   bash tests/render.sh "$t" > "$tmp/$t.sh"
 done
 shellcheck -S warning -s bash psiphon_install.sh tests/lint.sh tests/render.sh "$tmp"/*.sh

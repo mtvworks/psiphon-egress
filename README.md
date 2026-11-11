@@ -44,8 +44,8 @@ Those flags are not decoration:
 Re-running the installer keeps what the last run settled on: ports and the
 address they are published on, the region and pool (including where rotations
 have moved it), deny/accept lists, watchdog tuning and its targets, the container
-ceilings, the image, alerts and metrics. An explicit flag always wins;
-`--region ''` goes back to auto.
+ceilings, the image, alerts and metrics, and the Gemini, `--impersonate` and
+in-proxy switches. An explicit flag always wins; `--region ''` goes back to auto.
 
 The address matters most: xray's outbound in the panel dials it, so a bare re-run
 of a node installed with `--bind-loopback` must not move it to the gateway
@@ -97,6 +97,137 @@ So the watchdog also fetches the services the exit is for, listed in
 
 `vps-psiphon status` fetches the same URLs and prints a `target` line for each.
 
+## Asking Gemini itself
+
+A status code cannot see Gemini's own geo-check: where Gemini declines an
+address, its page still answers **200**, and the refusal — error **1060**,
+"Gemini isn't available in your region yet" — only arrives in the answer to a
+message. So at every check the watchdog runs `vps-psiphon-gemini-check`, ported
+from [vps-psiphon](https://github.com/Chara-Freedom/vps-psiphon) 1.2–1.3:
+
+1. fetch `gemini.google.com/app` through the tunnel for its session fields;
+2. send one logged-out message and hold the answer open — Gemini can take a
+   minute or more, and Psiphon's servers cut a connection on which no byte has
+   moved for 30 s, so a second request on the same HTTP/2 connection trickles one
+   byte every 2 s until the answer is in (two minutes at most);
+3. **1060 → rotate at once**, without waiting for the failure window (the
+   cooldown still applies). A reply → ok. Anything else is *inconclusive* and
+   never rotates.
+
+About 1 MB per check. `--no-gemini-check` turns it off; `vps-psiphon gemini`
+runs it by hand, `vps-psiphon gemini --direct` from the host's own address — to
+tell a burned exit from a refusal that follows the whole host.
+
+Where this copy differs from upstream, and why:
+
+- **A reply without a place is ok.** Upstream calls a reply ok only when Gemini
+  names the place it puts the exit in. Measured from a US datacenter on
+  2026-11-05, Gemini answered "Hello! How can I help you today?" run after run
+  and never named one — under upstream's rule a served exit stays inconclusive
+  forever. Here a response candidate with text is enough, and its first words go
+  into the log, so an answer that is itself an error reads as one.
+- **An older curl costs precision, not the check.** Holding the answer open
+  needs curl with `--parallel` (7.66) and HTTP/2. Without them the message goes
+  alone: a refusal that arrives within 30 s is still read, and the log line says
+  that slower answers are lost.
+- **A stale check alerts.** Upstream's check once stopped working for days when
+  Gemini changed the frame of its refusal: every refusal read as
+  "inconclusive", and nothing rotated. A check that settles nothing for 18
+  checks in a row (3 hours) now raises one alert (`GEMINI_STALE_CHECKS`).
+
+### Browser captcha: `--impersonate`
+
+Where Gemini leaves through the tunnel while `www.google.com` leaves from
+another address, Google can flag the exit **for browsers only**: Gemini sends a
+browser to `www.google.com/sorry`, the captcha is bound to the tunnel's address,
+and opened from the other one it offers nothing to solve. Plain curl gets the
+page through the same exit, so no check sees it.
+
+`--impersonate` installs [curl-impersonate](https://github.com/lexiforest/curl-impersonate)
+under `/opt/vps-psiphon/curl-impersonate`, and the Gemini check fetches its page
+as the newest Chrome the build knows; a redirect to `/sorry` rotates at once.
+The message itself still goes by plain curl, so a message Google sends to
+`/sorry` is logged as `inconclusive (the message was sent to /sorry)` and never
+rotates: a captcha for curl's handshake says nothing about what a browser gets.
+The latest release is checked against the sha256 GitHub publishes for it; if
+that cannot be read or fails, a pinned release (v2.3.2, digests in the
+installer) is taken. A first install with `--impersonate` stops before changing
+anything if neither works; a reinstall keeps the build it has, and one that was
+not asked for again on this run is never blocked by the download. Off by
+default: where all of Google goes through the tunnel the captcha can be solved,
+and rotating would lose a usable exit. `--no-impersonate` removes the build.
+
+## In-proxy and Psiphon's tactics
+
+Psiphon's servers send every client *tactics* — settings applied on top of its
+config — and they put **in-proxy** first: the first dials of each tunnel go
+through a volunteer's device over WebRTC. That is built for users whose networks
+block Psiphon; an exit carries a whole host's traffic, and upstream measured such
+tunnels dying within minutes or crawling at a few hundred KB/s, while direct ones
+carried megabytes a second for hours.
+
+So the launcher writes `"DisableTactics": true` into `psiphon.config` at every
+start, seeding the file from the image first so that even the first tunnel after
+an install gets it. That alone keeps in-proxy out: tunnel-core disables every
+`INPROXY-WEBRTC` protocol by default, never picks a default-disabled one without
+a protocol limit, and only tactics can enable them — with tactics off it applies
+none, not even stored ones.
+
+Upstream also writes a `LimitTunnelProtocols` list. It names exactly the
+default-enabled protocols, so it adds nothing, and it is the one setting that
+can stop the client from starting: tunnel-core refuses a protocol name its build
+does not know, and an image newer or older than the list would loop on a dead
+tunnel. It is not written here (a list in the one-line form upstream writes is
+removed). The watchdog logs every tunnel the client brings up with its
+protocol — `tunnel up: QUIC-OSSH (dialled at …)` — which is where the exclusion
+shows. `--inproxy` lets Psiphon choose again.
+
+The launcher also raises Psiphon's window per connection from 128 KB to 1 MB
+(`"SSHChannelWindowSize": 32`): the default caps one connection at about
+20 Mbit/s over a 30 ms tunnel, however idle it is, and 1 MB measured 5–14×
+faster per connection in vps-psiphon's tests with no added wait for a small
+request behind eight downloads.
+
+Nothing the launcher edits can keep the tunnel from starting: every step is
+checked, and a config it cannot read in the shape it knows is left as the image
+wrote it — `status` then says in-proxy is not excluded, and one alert goes out.
+A config that is not JSON at all (Psiphon would stop on it at every start) is
+moved to `psiphon.config.broken` and seeded afresh. The one thing the launcher
+refuses is an address or port the installer would not write: an empty `BIND`
+in a hand-edited env file would publish the SOCKS on every interface — an open
+proxy — so it does not start at all.
+The regions are written from the env file at every start, auto as
+`"EgressRegion": ""`: the image's template says `SG` and replaces it only when a
+region is set, so auto used to mean Singapore — and a config written before
+kept saying so. A value in the env file that is not a two-letter code is not
+written; the launcher says so and starts anyway.
+
+## Every rotation is a fresh draw
+
+The client keeps the servers it knows in its config directory, and a plain
+restart kept bringing it back to the same server in the country: in
+vps-psiphon's journal, 13 rotations into one country over two days all came
+back to one server, and a pool of four countries kept landing on the same four
+exits. So every rotation — the watchdog's and `vps-psiphon rotate` — and
+`region` stop the client, empty `/opt/vps-psiphon/config` and start it again;
+the launcher seeds `psiphon.config` from the image's template and the env file.
+`advance-region` only edits the env file. (Ported from vps-psiphon 1.3.)
+
+## When rotations do not help
+
+A rotation drops every live connection. When the fault follows the host rather
+than the exit — Google refusing the node's whole pool, an upstream outage, a
+check gone stale — rotating every cooldown changes nothing but that. After
+**three rotations in a row with no passing check between them**, the cooldown
+doubles with each further one up to `ROTATE_COOLDOWN_MAX` (default 7200 s), and
+one alert says so; the first passing check ends it. Set `ROTATE_COOLDOWN_MAX`
+equal to `ROTATE_COOLDOWN` to turn it off.
+
+Failures also belong to the tunnel they were counted on: a tunnel started by
+anything — the watchdog, `rotate`, `region`, the installer, a crash — begins
+with an empty failure window (upstream's fix, ported), and a check during which
+the tunnel restarted is not judged at all.
+
 ## Verifying it is not an open proxy
 
 ```bash
@@ -137,6 +268,7 @@ vps-psiphon region DE               pin one country
 vps-psiphon pool 'DE NL FR'         set the rotation pool
 vps-psiphon accept 'DE NL'          which verdicts are acceptable
 vps-psiphon update-image [--check]  move the pinned digest to the followed tag's build
+vps-psiphon gemini [--direct]       ask Gemini now, through the tunnel or from the host
 vps-psiphon notify-test             send a test Telegram alert
 vps-psiphon speed                   throughput through the tunnel
 vps-psiphon logs / watchdog         container log / watchdog journal
@@ -169,10 +301,12 @@ A reinstall keeps the pinned digest and the followed tag. `--image repo@sha256:�
 
 Both are off unless configured.
 
-- **Telegram**: `--tg-token <bot token> --tg-chat <chat id>` (or `VPSPSI_TG_TOKEN=<bot token>` in the environment instead of `--tg-token`, which keeps the token out of `ps` and the shell history). The watchdog sends
+- **Telegram**: `--tg-token <bot token> --tg-chat <chat id> [--tg-thread <topic id>]` (or `VPSPSI_TG_TOKEN=<bot token>` in the environment instead of `--tg-token`, which keeps the token out of `ps` and the shell history). The watchdog sends
   an alert on every rotation (reason, old → new exit, region step), the first
   time an exit is seen in a denied country or refused by a target, and when a
-  rotation did not bring the tunnel back. Alerts go directly, not through the tunnel. The token is kept in
+  rotation did not bring the tunnel back; once each when rotations start backing
+  off, when the Gemini check has settled nothing for three hours, when the
+  launcher could not edit `psiphon.config`, and when `--impersonate` is on without a build. Alerts go directly, not through the tunnel. The token is kept in
   `/etc/default/vps-psiphon` (mode 0600) and never passed on a command line.
   `vps-psiphon notify-test` checks the setup.
 - **Prometheus**: if `/var/lib/node_exporter/textfile_collector` exists (or
@@ -181,7 +315,10 @@ Both are off unless configured.
   `vps_psiphon_throughput_kbps`, `vps_psiphon_window_failures`,
   `vps_psiphon_rotations_total`, `vps_psiphon_last_rotate_timestamp_seconds`,
   `vps_psiphon_captcha`, `vps_psiphon_target_refused`,
-  `vps_psiphon_country_info{gl="XX"}`, `vps_psiphon_last_check_timestamp_seconds`.
+  `vps_psiphon_country_info{gl="XX"}`, `vps_psiphon_last_check_timestamp_seconds`,
+  `vps_psiphon_gemini_result` (0 ok, 1 refused, 2 inconclusive, 3 captcha),
+  `vps_psiphon_gemini_inconclusive_streak`, `vps_psiphon_rotation_cooldown_seconds`,
+  `vps_psiphon_inproxy_excluded`.
 
 The watchdog log is rotated weekly through `/etc/logrotate.d/vps-psiphon`.
 
@@ -197,6 +334,8 @@ The watchdog log is rotated weekly through `/etc/logrotate.d/vps-psiphon`.
 | **Reinstall keeps state** | region, published address, container ceilings, image, tuning and alerts survive a re-run instead of silently resetting. |
 | **Watchdog fixes** | a timed-out transfer is judged as slow, not as a dead tunnel; `status` applies the deny-list like the watchdog does; one lock for the watchdog and manual commands. |
 | **Target checks** | the services the exit is for (`PROBE_URLS`) are fetched through it; a 403/451 rotates — Google refuses single exits per service while the other checks read green. |
+| **From upstream 1.2–1.3** | the Gemini check with the 1060 refusal and the held-open answer, `--impersonate`, the in-proxy exclusion with tactics off, failures counted per tunnel, a fresh draw of servers at every rotation, regions written at every start — see the sections above, and [CREDITS.md](CREDITS.md). |
+| **Fault tolerance around them** | a reply without a place counts as served; an older curl degrades the check instead of breaking it; a stale Gemini check alerts; in-proxy kept out by tactics off alone, without the protocol list that can stop the client; the launcher never fails a start over its own edits; back-off for futile rotations; curl-impersonate installed root-owned whatever the archive says; a reinstall is not blocked by a curl-impersonate download it did not ask for; the watchdog unit is cut off after 15 min instead of hanging its timer. |
 | **`update-image`, alerts, metrics** | moving the digest pin in the open; Telegram alerts; node_exporter metrics; log rotation. |
 | **Tests and CI** | `bats tests` and `tests/lint.sh` (shellcheck, generated scripts included) run on every push. |
 

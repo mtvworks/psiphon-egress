@@ -20,6 +20,42 @@ drew exits that Google geolocates to **RU** — on a fast, healthy, perfectly
 reachable tunnel. For anyone running a VPN out of that country, such an exit is
 worse than no tunnel. Liveness probes call it healthy. This watchdog rotated it.
 
+### Ported later from upstream 1.0–1.3 (2026-10-26 … 2026-11-11)
+
+We forked before upstream's Gemini check existed. These came over afterwards, with
+the author's measurements quoted in the comments where they justify a choice:
+
+- the **Gemini check** itself (`vps-psiphon-gemini-check`): asking Gemini, not its
+  page's status code, so that error 1060 is seen at all; the refusal's new frame
+  (1.0.1); holding the answer open past Psiphon's 30 s idle cut with a second
+  request on the same HTTP/2 connection (1.1);
+- **`--impersonate`** (1.2): the captcha Google shows browsers alone on an exit,
+  caught by fetching the page with curl-impersonate, with a pinned fallback release;
+- **tactics off**, which keeps in-proxy out (1.0), and the tunnel-protocol log read
+  from the client's datastore — but not upstream's `LimitTunnelProtocols` list, which
+  names only the default-enabled protocols and is the one setting that can stop the
+  client from starting;
+- **failures belong to the tunnel they were counted on**, and a check during which
+  the tunnel restarted is not judged;
+- from 1.3: **every rotation starts the client on an empty config directory**, so it
+  draws a server afresh instead of returning to the one it knows; **the regions are
+  written from the env file at every start**, so auto is no longer the template's
+  Singapore; and a message Google sends to `/sorry` is logged apart from silence;
+- the **1 MB window per connection** (`SSHChannelWindowSize` 32, upstream 2026-09-26),
+  which the first port missed.
+
+Not ported: upstream's `--tunnel-pool N` (several tunnels in one instance, opt-in).
+This watchdog judges one tunnel at a time — failures belong to the tunnel they were
+counted on, a new tunnel starts a clean window, the Gemini check asks about one exit —
+and with a pool every probe rides whichever tunnel takes it, so none of those
+judgements would hold. Our nodes run one tunnel each.
+
+What we changed in them, and why, is in the README ("Asking Gemini itself", "In-proxy
+and Psiphon's tactics", "When rotations do not help"): a reply without a place counts
+as served (measured), an older curl degrades the check instead of breaking it, a
+stale check alerts, the launcher never fails a start over its own edits, and futile
+rotations back off.
+
 ## Hardening ideas — [DenFiord/remnascripts](https://github.com/DenFiord/remnascripts) (MIT)
 
 A markedly more engineered project (bats tests, CI, `SECURITY.md`, a "container

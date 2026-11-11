@@ -18,12 +18,16 @@
 #   /usr/local/sbin/vps-psiphon-run       container launcher (systemd ExecStart)
 #   /usr/local/sbin/vps-psiphon-watchdog  liveness + burned-exit detector
 #   /usr/local/sbin/vps-psiphon-advance-region  walks REGION_POOL on each rotation
+#   /usr/local/sbin/vps-psiphon-gemini-check    asks Gemini itself whether it serves the exit
 #   /usr/local/sbin/vps-psiphon           management CLI
 #   /etc/systemd/system/vps-psiphon.service
 #   /etc/systemd/system/vps-psiphon-watchdog.service + .timer
 #   /opt/vps-psiphon/config               psiphon's own config and server list
+#   /opt/vps-psiphon/curl-impersonate     with --impersonate: a browser build of curl
 #   /var/log/vps-psiphon-watchdog.log     watchdog journal
 #   /var/lib/vps-psiphon-watchdog.state   watchdog counters
+#   /var/lib/vps-psiphon-watchdog.seen    the last tunnel the watchdog logged
+#   /var/lib/vps-psiphon-run.state        what the launcher made of the last start
 #
 # `vps-psiphon uninstall` removes all of those, the container, the image and itself.
 set -euo pipefail
@@ -64,6 +68,15 @@ BIND="${BIND:-}"
 # the check off. The reasoning sits beside PROBE_URLS in the env file below.
 PROBE_URLS_DEFAULT="https://gemini.google.com/app"
 PROBE_URLS=""; PROBE_URLS_SET=0
+# The watchdog asks Gemini itself at every check (vps-psiphon-gemini-check): a refusal
+# (error 1060) arrives on a page that answers 200, which no status-code probe sees.
+GEMINI_CHECK=1; GEMINI_CHECK_SET=0
+# With --impersonate the Gemini check fetches its page with a browser's TLS handshake,
+# so a captcha Google shows browsers alone rotates the exit. Off unless asked for.
+IMPERSONATE=0; IMPERSONATE_SET=0
+# Psiphon's in-proxy (WebRTC through a volunteer's device) is kept out of the tunnel
+# protocols; --inproxy lets Psiphon choose again. The reasoning is in the launcher.
+EXCLUDE_INPROXY=1; EXCLUDE_INPROXY_SET=0
 
 SOCKS_PORT="${SOCKS_PORT:-1080}"
 HTTP_PORT="${HTTP_PORT:-8080}"
@@ -86,6 +99,8 @@ ACCEPT_REGIONS=""; ACCEPT_REGIONS_SET=0
 # Optional Telegram alerts from the watchdog (rotation, denied country). Both empty =
 # off. Kept across reinstalls unless given again; '' turns them off.
 TG_TOKEN=""; TG_TOKEN_SET=0; TG_CHAT=""; TG_CHAT_SET=0
+# Optional forum topic (message_thread_id) inside TG_CHAT; empty = the chat itself.
+TG_THREAD=""; TG_THREAD_SET=0
 # The token may come from the environment instead of --tg-token, so it stays out of
 # `ps` and the shell history: VPSPSI_TG_TOKEN=... bash psiphon_install.sh --tg-chat ...
 if [ -n "${VPSPSI_TG_TOKEN+x}" ]; then TG_TOKEN="$VPSPSI_TG_TOKEN"; TG_TOKEN_SET=1; fi
@@ -132,11 +147,33 @@ img_canon()  {
   if [ -n "$d" ]; then printf '%s@%s' "$(img_repo "$1")" "$d"; else printf '%s' "$1"; fi
 }
 
-# The generated launcher and CLI need these too. They get these exact definitions,
+# The tunnel restarted on an empty config directory, which the launcher seeds again from
+# the env file. The client keeps the servers it knows in that directory, and a plain
+# restart kept bringing it back to the same server in the country: rotations through a
+# pool of four countries kept landing on the same four exits — in one journal, 13
+# rotations into one country over two days all came back to one server — and a pool with
+# no good exit among them never left it (measured by vps-psiphon 1.3, whose fix this is).
+# Every rotation (the watchdog's, `rotate`) and `region` start this way. A CONF_DIR of
+# fewer than two path components is refused: the env file is edited by hand, and this
+# empties the directory it names.
+fresh_start() {
+  local c="${CONF_DIR:-/opt/vps-psiphon/config}"
+  # Two or more plain components, no trailing slash, no "." or ".." among them: /opt/,
+  # //, /opt/.. and the like are refused rather than emptied.
+  if ! [[ "$c" =~ ^(/[A-Za-z0-9_][A-Za-z0-9._-]*){2,}$ ]] || [[ "$c" =~ /\.\.?(/|$) ]]; then
+    echo "CONF_DIR='$c' is not a directory this would empty — restarting without a fresh start" >&2
+    systemctl restart vps-psiphon.service; return 1
+  fi
+  systemctl stop vps-psiphon.service
+  rm -rf "${c:?}"/*; mkdir -p "$c"; chown -R 1000:1000 "$c"
+  systemctl start vps-psiphon.service
+}
+
+# The generated launcher, watchdog and CLI need these too. They get these exact definitions,
 # written in where @@SHARED_FUNCS@@ stands, rather than a hand-kept second copy that
 # could drift: the reinstall path and update-image must parse IMAGE the same way.
 # Through ENVIRON, not awk -v, which would expand the \n inside cc_list.
-SHARED_FUNCS="$(declare -f cc_list img_repo img_tag img_tagged img_digest img_canon)"
+SHARED_FUNCS="$(declare -f cc_list img_repo img_tag img_tagged img_digest img_canon fresh_start)"
 put_shared_funcs() {
   local f="$1" t; t="$(mktemp "$f.XXXXXX")"
   SHARED_FUNCS="$SHARED_FUNCS" awk '$0 == "@@SHARED_FUNCS@@" { print ENVIRON["SHARED_FUNCS"]; next } { print }' \
@@ -208,9 +245,27 @@ psiphon_install.sh [options]
                        through the tunnel; a 403 or 451 from any of them rotates.
                        Default https://gemini.google.com/app; kept across
                        reinstalls; '' turns the check off.
+  --no-gemini-check    do not ask Gemini itself at every check. On by default: a
+                       logged-out message is sent through the tunnel and Gemini's
+                       refusal (error 1060, on a page that answers 200) rotates the
+                       exit at once. About 1 MB per check. --gemini-check turns it
+                       back on; remembered across reinstalls.
+  --impersonate        install curl-impersonate and let the Gemini check fetch its
+                       page with a browser's TLS handshake. Google can flag an exit
+                       for browsers alone and send them to a captcha; a redirect
+                       to it then rotates at once. For a node whose Gemini leaves
+                       through this tunnel while www.google.com does not — there
+                       that captcha cannot be solved. Remembered across reinstalls
+  --no-impersonate     turn it off again and remove curl-impersonate
+  --inproxy            let Psiphon pick in-proxy tunnels (WebRTC through a
+                       volunteer's device) and apply its server-sent tactics. Off
+                       by default: under an exit's load such tunnels died within
+                       minutes or crawled. --no-inproxy restores the default.
   --tg-token TOKEN     Telegram bot token for watchdog alerts (rotations, denied
   --tg-chat ID         country). Both are needed; '' turns alerts off. Kept across
                        reinstalls. Test with: vps-psiphon notify-test
+  --tg-thread ID       optional forum topic (message_thread_id) inside that chat;
+                       default: the chat itself. Kept across reinstalls.
   --metrics-dir DIR    where the watchdog writes vps-psiphon.prom for the
                        node_exporter textfile collector. Default: kept from the
                        last install, else /var/lib/node_exporter/textfile_collector
@@ -249,11 +304,18 @@ while [ $# -gt 0 ]; do
     --image)         IMAGE="${2:?}"; IMAGE_SET=1; shift 2 ;;
     --tg-token)      TG_TOKEN="${2:-}"; TG_TOKEN_SET=1; shift 2 ;;
     --tg-chat)       TG_CHAT="${2:-}";  TG_CHAT_SET=1;  shift 2 ;;
+    --tg-thread)     TG_THREAD="${2:-}"; TG_THREAD_SET=1; shift 2 ;;
     --metrics-dir)   METRICS_DIR="${2:-}"; METRICS_DIR_SET=1; shift 2 ;;
     --memory)        MEM_LIMIT="${2:?}";  MEM_LIMIT_SET=1;  shift 2 ;;
     --pids-limit)    PIDS_LIMIT="${2:?}"; PIDS_LIMIT_SET=1; shift 2 ;;
     --no-watchdog)   WATCHDOG=0;             shift   ;;
     --probe-urls)    PROBE_URLS="${2:-}"; PROBE_URLS_SET=1; shift 2 ;;
+    --gemini-check)    GEMINI_CHECK=1;    GEMINI_CHECK_SET=1;    shift ;;
+    --no-gemini-check) GEMINI_CHECK=0;    GEMINI_CHECK_SET=1;    shift ;;
+    --impersonate)     IMPERSONATE=1;     IMPERSONATE_SET=1;     shift ;;
+    --no-impersonate)  IMPERSONATE=0;     IMPERSONATE_SET=1;     shift ;;
+    --inproxy)         EXCLUDE_INPROXY=0; EXCLUDE_INPROXY_SET=1; shift ;;
+    --no-inproxy)      EXCLUDE_INPROXY=1; EXCLUDE_INPROXY_SET=1; shift ;;
     -h|--help)       usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage; exit 1 ;;
   esac
@@ -296,6 +358,8 @@ check_extras() {
     || die "--tg-token: not a bot token (digits:letters, as BotFather prints it)"
   [ -z "$TG_CHAT" ] || printf '%s\n' "$TG_CHAT" | grep -qxE -e '-?[0-9]+|@[A-Za-z0-9_]+' \
     || die "--tg-chat: expected a numeric chat id or @channelname"
+  [ -z "$TG_THREAD" ] || printf '%s\n' "$TG_THREAD" | grep -qxE '[0-9]+' \
+    || die "--tg-thread: expected a numeric topic id"
   [ -z "$METRICS_DIR" ] || printf '%s\n' "$METRICS_DIR" | grep -qxE '/[A-Za-z0-9._/-]*' \
     || die "--metrics-dir: expected an absolute path"
   # Normalised to single spaces, then each URL held to plain https:// characters: the
@@ -328,7 +392,7 @@ command -v flock >/dev/null || die "flock is not installed (package util-linux)"
 # overlapping restart reads below as a tunnel that never started. The watchdog skips
 # while this is held, the CLI waits.
 exec 9>/run/vps-psiphon.lock
-flock -w 300 9 || die "a watchdog check or vps-psiphon command has held the lock for 5 minutes — try again"
+flock -w 600 9 || die "a watchdog check or vps-psiphon command has held the lock for 10 minutes — try again"
 
 # ------------------------------------------------------------- bind address --
 # Where the SOCKS5 is published decides whether the kernel can carry it. Docker
@@ -386,6 +450,24 @@ restore_limits() {
   if [ "$LOG_MAX_FILE_SET" = 0 ]; then
     v="$(sed -n 's/^LOG_MAX_FILE=//p' "$ENVF" | head -1 | tr -d "'")"
     [ -z "$v" ] || LOG_MAX_FILE="$v"
+  fi
+}
+# The on/off switches likewise. Only 0 or 1 is taken back: the file is sourced, and
+# anything else there was not written by this script. An install older than a switch
+# has no line for it and gets the default.
+restore_switches() {
+  local v
+  if [ "$GEMINI_CHECK_SET" = 0 ]; then
+    v="$(sed -n 's/^GEMINI_CHECK=//p' "$ENVF" | head -1 | tr -d "'")"
+    case "$v" in 0|1) GEMINI_CHECK="$v" ;; esac
+  fi
+  if [ "$IMPERSONATE_SET" = 0 ]; then
+    v="$(sed -n 's/^IMPERSONATE=//p' "$ENVF" | head -1 | tr -d "'")"
+    case "$v" in 0|1) IMPERSONATE="$v" ;; esac
+  fi
+  if [ "$EXCLUDE_INPROXY_SET" = 0 ]; then
+    v="$(sed -n 's/^EXCLUDE_INPROXY=//p' "$ENVF" | head -1 | tr -d "'")"
+    case "$v" in 0|1) EXCLUDE_INPROXY="$v" ;; esac
   fi
 }
 if [ -z "$BIND" ]; then
@@ -506,6 +588,7 @@ if [ -r "$ENVF" ]; then
   fi
   [ "$TG_TOKEN_SET" = 1 ]    || TG_TOKEN="$(stored TG_TOKEN)"
   [ "$TG_CHAT_SET" = 1 ]     || TG_CHAT="$(stored TG_CHAT)"
+  [ "$TG_THREAD_SET" = 1 ]   || TG_THREAD="$(stored TG_THREAD)"
   # A line present but empty is a decision (metrics off) and survives; no line at all
   # is an install older than the option, which gets the default below.
   if [ "$METRICS_DIR_SET" = 0 ] && grep -q '^METRICS_DIR=' "$ENVF"; then
@@ -515,6 +598,7 @@ if [ -r "$ENVF" ]; then
   if [ "$PROBE_URLS_SET" = 0 ] && grep -q '^PROBE_URLS=' "$ENVF"; then
     PROBE_URLS="$(stored PROBE_URLS)"; PROBE_URLS_SET=1
   fi
+  restore_switches
   restore_limits
 fi
 if [ "$METRICS_DIR_SET" = 0 ] && [ -d "$METRICS_DIR_DEFAULT" ]; then
@@ -597,22 +681,172 @@ fi
 if [ "$PUBLISH_HTTP" = 1 ]; then HTTP_DESC="$BIND:$HTTP_PORT"; else HTTP_DESC="not published"; fi
 say "image=$IMAGE  egress=${EGRESS_REGION:-auto}  device=$DEVICE_REGION  socks=$BIND:$SOCKS_PORT  http=$HTTP_DESC"
 
+# --------------------------------------------------------- curl-impersonate --
+# With --impersonate the Gemini check fetches its page with a browser's TLS handshake.
+# The build is the latest release of lexiforest/curl-impersonate, checked against the
+# sha256 digest GitHub publishes for the asset. Both are read from github.com, not from
+# the API: the API's anonymous limit is 60 requests an hour per address, and an exit
+# shares its address with everything its users run. Fetched before anything is
+# written, so a failure leaves the host as it was. (Ported from vps-psiphon 1.2.)
+CI_DIR=/opt/vps-psiphon/curl-impersonate
+CI_REPO=lexiforest/curl-impersonate
+# A known-good release, taken when the latest cannot be read, fetched, verified or run.
+# Its digests are written here, so neither a change to GitHub's release page nor a newer
+# release that is renamed or broken stops the install. Google's flag answers any
+# browser's handshake, so an older Chrome serves as well as the newest. Each digest was
+# checked against the asset GitHub serves.
+CI_PIN=v2.3.2
+ci_pin_sum() {
+  case "$1" in
+    aarch64-linux-gnu)   echo 35a351db883f5ce82945bd8280c727b08e27aa48594d4eb9e091d8c80e936d52 ;;
+    aarch64-linux-musl)  echo 1519bcee11f9c93a7ed95026bd951d53e8c7cd093f3ac53651b143e5a1e2098f ;;
+    arm-linux-gnueabihf) echo a5bc29ea22c15286d8cecfed601cd222f569cd734a8d17232aece7bea0e6fe42 ;;
+    i386-linux-gnu)      echo c15fd50d8f1e3811c9a048942505ec476aad0aa432d5f2aebcd63ccb1ebcac16 ;;
+    riscv64-linux-gnu)   echo 23089329bdd51fb29d5d2ae730fbe5933b117b4f6e9734569a931b2b1813106f ;;
+    x86_64-linux-gnu)    echo bc9bd2522fe1850dd54c0fff189c8dd606df3f222ab2a905f2dd255123c3f495 ;;
+    x86_64-linux-musl)   echo ce79849f3be2e15d06364f89aeebb901b6be7b48947e2af8dae0616bbc87731f ;;
+  esac
+}
+
+# Downloads release $1's asset $2, checks it against sha256 $3 and puts it in place;
+# on failure prints why and returns 1, leaving the installed build untouched. Called
+# inside $(...), where set -e does not hold, so every step is checked by hand.
+ci_fetch() {
+  local tag="$1" asset="$2" sum="$3" tmp
+  tmp="$(mktemp -d)" || { echo "no temp dir"; return 1; }
+  if ! curl -fsSL --max-time 300 -o "$tmp/$asset" \
+       "https://github.com/$CI_REPO/releases/download/$tag/$asset"; then
+    rm -rf "$tmp"; echo "could not download $asset"; return 1
+  fi
+  if [ "$(sha256sum "$tmp/$asset" | cut -d' ' -f1)" != "$sum" ]; then
+    rm -rf "$tmp"; echo "$asset does not match its sha256"; return 1
+  fi
+  mkdir "$tmp/x" || { rm -rf "$tmp"; echo "no temp dir"; return 1; }
+  # Owned by root and writable by root alone. The release's files carry the builder's
+  # uid (1001 for v2.3.2), and tar run as root keeps it by default: whoever holds that
+  # uid on this host could then rewrite a curl_chromeN wrapper — a shell script — that
+  # the root watchdog runs every ten minutes. Only plain files and directories are
+  # taken, so no link in the archive can point an install outside this directory.
+  if ! tar --no-same-owner --no-same-permissions -xzf "$tmp/$asset" -C "$tmp/x" 2>/dev/null ||
+     [ -n "$(find "$tmp/x" ! -type f ! -type d -print -quit)" ] ||
+     ! chown -R 0:0 "$tmp/x" || ! chmod -R u+rwX,go+rX,go-w "$tmp/x"; then
+    rm -rf "$tmp"; echo "$asset could not be unpacked as plain root-owned files"; return 1
+  fi
+  # The Gemini check needs the binary and one curl_chromeN wrapper, the newest of which
+  # it runs. The binary is run once here, so a build for the wrong libc is refused now
+  # rather than discovered by the watchdog.
+  if ! "$tmp/x/curl-impersonate" --version >/dev/null 2>&1 ||
+     [ -z "$(find "$tmp/x" -maxdepth 1 -name 'curl_chrome[0-9]*' -print -quit)" ]; then
+    rm -rf "$tmp"; echo "$asset holds no working curl-impersonate with a Chrome profile"; return 1
+  fi
+  printf '%s\n' "$tag" > "$tmp/x/VERSION" || { rm -rf "$tmp"; echo "could not write VERSION"; return 1; }
+  # Staged next to the target (the copy out of /tmp is the step a full disk breaks), and
+  # the old build is moved aside, not deleted, until the new one stands in its place.
+  rm -rf "${CI_DIR:?}.new" "${CI_DIR:?}.old"
+  if ! mkdir -p "${CI_DIR%/*}" || ! mv "$tmp/x" "$CI_DIR.new"; then
+    rm -rf "$tmp" "${CI_DIR:?}.new"; echo "could not copy the build to ${CI_DIR%/*}"; return 1
+  fi
+  rm -rf "$tmp"
+  if [ -e "$CI_DIR" ] && ! mv "$CI_DIR" "$CI_DIR.old"; then
+    rm -rf "${CI_DIR:?}.new"; echo "could not move the installed build aside"; return 1
+  fi
+  if ! mv "$CI_DIR.new" "$CI_DIR"; then
+    [ -e "$CI_DIR.old" ] && mv "$CI_DIR.old" "$CI_DIR"
+    rm -rf "${CI_DIR:?}.new"; echo "could not put the new build in place"; return 1
+  fi
+  rm -rf "${CI_DIR:?}.old"
+  echo "$tag ($asset, sha256 ${sum:0:12}…)"
+}
+
+impersonate_install() {
+  local arch libc tag="" sum="" why pin out have
+  case "$(uname -m)" in
+    x86_64|amd64)  arch=x86_64 ;;
+    aarch64|arm64) arch=aarch64 ;;
+    armv7l)        arch=arm ;;
+    i?86)          arch=i386 ;;
+    riscv64)       arch=riscv64 ;;
+    *) echo "no build is published for $(uname -m)"; return 1 ;;
+  esac
+  # Not a pipe into grep -q: musl's ldd exits 1, and under pipefail that hides the match.
+  case "$(ldd --version 2>&1 || true)" in
+    *musl*) libc=linux-musl ;;
+    *)      libc=linux-gnu ;;
+  esac
+  [ "$arch" = arm ] && libc=linux-gnueabihf
+
+  # The latest release redirects to its tag: read off the redirect a GET gets, which
+  # also works where a proxy refuses HEAD. The tag goes into URLs and a file name, so
+  # anything but a plain tag is ignored. The tag's asset list names each asset's digest
+  # in the label of its copy button — page markup, not an API contract: if GitHub
+  # changes it, no digest is found and the pinned release is taken.
+  tag="$(curl -s -o /dev/null --max-time 20 -w '%{redirect_url}' \
+         "https://github.com/$CI_REPO/releases/latest" 2>/dev/null \
+         | sed -n 's#^https://github.com/.*/releases/tag/##p' || true)"
+  printf '%s\n' "$tag" | grep -qxE '[A-Za-z0-9._-]{1,40}' || tag=""
+  if [ -n "$tag" ]; then
+    sum="$(curl -fsS --max-time 20 "https://github.com/$CI_REPO/releases/expanded_assets/$tag" \
+           2>/dev/null | grep -oE "sha256:[0-9a-f]{64}\" aria-label=\"Copy to clipboard digest for curl-impersonate-$tag.$arch-$libc.tar.gz\"" \
+           | head -1 | cut -c8-71 || true)"
+  fi
+  # A build of that very release, checked when it was installed, is kept: a reinstall for
+  # another reason should not hang on a 30 MB download, nor fail on one.
+  have="$(cat "$CI_DIR/VERSION" 2>/dev/null || true)"
+  if [ -n "$tag" ] && [ "$have" = "$tag" ] && [ -x "$CI_DIR/curl-impersonate" ]; then
+    echo "$tag, already installed"; return 0
+  fi
+  if [ -n "$tag" ] && [ -n "$sum" ]; then
+    why="$(ci_fetch "$tag" "curl-impersonate-$tag.$arch-$libc.tar.gz" "$sum")" && { echo "$why"; return 0; }
+  else
+    why="could not read the latest release${tag:+ ($tag)} or its digest for $arch-$libc"
+  fi
+
+  pin="$(ci_pin_sum "$arch-$libc")"
+  [ -n "$pin" ] || { echo "$why; no pinned build for $arch-$libc either"; return 1; }
+  if [ "$have" = "$CI_PIN" ] && [ -x "$CI_DIR/curl-impersonate" ]; then
+    echo "$CI_PIN, already installed — the pinned release, as the latest failed: $why"; return 0
+  fi
+  if out="$(ci_fetch "$CI_PIN" "curl-impersonate-$CI_PIN.$arch-$libc.tar.gz" "$pin")"; then
+    echo "$out — the pinned release, as the latest failed: $why"; return 0
+  fi
+  echo "$why; the pinned $CI_PIN failed too: $out"; return 1
+}
+if [ "$IMPERSONATE" = 1 ]; then
+  [ "$GEMINI_CHECK" = 1 ] || say "!! --impersonate acts through the Gemini check, which is off (--no-gemini-check)"
+  say "fetching curl-impersonate"
+  if CI_MSG="$(impersonate_install)"; then
+    say "curl-impersonate $CI_MSG"
+  elif [ -x "$CI_DIR/curl-impersonate" ]; then
+    say "!! curl-impersonate: $CI_MSG — keeping the installed $(cat "$CI_DIR/VERSION" 2>/dev/null || echo build)"
+  elif [ "$IMPERSONATE_SET" = 1 ]; then
+    die "curl-impersonate: $CI_MSG.
+       --impersonate needs it, so nothing was installed. Re-run later, or run
+       without --impersonate."
+  else
+    # Asked for on an earlier run, not on this one: a reinstall made for another reason
+    # is not blocked by a download. The check fetches its page by plain curl and says
+    # so in every line it logs, and the watchdog alerts once.
+    say "!! curl-impersonate: $CI_MSG — no build installed; the Gemini check falls back to plain curl until a re-run fetches one"
+  fi
+fi
+
 # ------------------------------------------------------------------ install --
 mkdir -p "$CONF_DIR"
-# The image seeds /config once and then ignores EGRESS_REGION, so a stale config
-# would silently keep the old country across a --region change.
-OLD_REGION="__none__"
+# A changed region is a new draw of servers, as `region` is: the restart at the end is
+# then a fresh start (fresh_start), which stops the client before emptying CONF_DIR —
+# never under a running one. The region itself the launcher writes at every start.
+OLD_REGION="__none__"; REGION_CHANGED=0
 [ -r "$ENVF" ] && OLD_REGION="$(sed -n 's/^EGRESS_REGION=//p' "$ENVF")"
 if [ "$OLD_REGION" != "__none__" ] && [ "$OLD_REGION" != "$EGRESS_REGION" ]; then
-  say "egress region ${OLD_REGION:-auto} -> ${EGRESS_REGION:-auto}: clearing cached config"
-  rm -rf "${CONF_DIR:?}"/*
+  say "egress region ${OLD_REGION:-auto} -> ${EGRESS_REGION:-auto}: the tunnel starts on a fresh server list"
+  REGION_CHANGED=1
 fi
 chown -R 1000:1000 "$CONF_DIR"
 
 # Preserve operator-set values across a reinstall.
 OLD_OK_REGIONS=""; OLD_MIN_THROUGHPUT=""; OLD_REGION_POOL=""
 OLD_FAIL_WINDOW=""; OLD_GRACE=""; OLD_ACCEPT_REGIONS=""
-OLD_FAIL_THRESHOLD=""; OLD_COOLDOWN=""
+OLD_FAIL_THRESHOLD=""; OLD_COOLDOWN=""; OLD_COOLDOWN_MAX=""
 # Tracked as set-or-not, not by value: a deliberately emptied deny-list is a choice
 # the next reinstall must not undo.
 OLD_DENY_SET=0; OLD_DENY_REGIONS=""
@@ -630,6 +864,7 @@ if [ -r "$ENVF" ]; then
   OLD_FAIL_WINDOW="$(sed -n 's/^FAIL_WINDOW=//p' "$ENVF")"
   OLD_FAIL_THRESHOLD="$(sed -n 's/^FAIL_THRESHOLD=//p' "$ENVF")"
   OLD_COOLDOWN="$(sed -n 's/^ROTATE_COOLDOWN=//p' "$ENVF")"
+  OLD_COOLDOWN_MAX="$(sed -n 's/^ROTATE_COOLDOWN_MAX=//p' "$ENVF")"
   OLD_GRACE="$(sed -n 's/^THROUGHPUT_GRACE_SEC=//p' "$ENVF")"
   OLD_REGION_POOL="$(sed -n 's/^REGION_POOL=//p' "$ENVF" | tr -d "'")"
   # An explicit --region wins; otherwise an existing pool survives the reinstall.
@@ -699,6 +934,13 @@ CONF_DIR=$CONF_DIR
 FAIL_THRESHOLD=${OLD_FAIL_THRESHOLD:-2}
 FAIL_WINDOW=${OLD_FAIL_WINDOW:-5}
 ROTATE_COOLDOWN=${OLD_COOLDOWN:-1800}
+# Rotations that do not help back off. After three rotations in a row with no passing
+# check between them, the cooldown doubles with each further one, up to this many
+# seconds, and an alert says so once. A fault that follows the host rather than the
+# exit — Google refusing the node's whole pool, a broken upstream, a check that has
+# gone stale — would otherwise drop every live connection twice an hour, forever. Set
+# it equal to ROTATE_COOLDOWN to turn the back-off off.
+ROTATE_COOLDOWN_MAX=${OLD_COOLDOWN_MAX:-7200}
 #
 # NOTE: this file is sourced by the shell, so any value containing spaces MUST be
 # quoted. Unquoted, everything after the first space is run as a command.
@@ -761,17 +1003,45 @@ ACCEPT_REGIONS='$ACCEPT_REGIONS'
 # noticed. Nothing else is judged — not a timeout, a 5xx or a redirect: the target can
 # be down for reasons of its own, and a dead tunnel is caught above. Empty disables.
 PROBE_URLS='$PROBE_URLS'
+# 1: the watchdog asks Gemini itself at every check (vps-psiphon-gemini-check): the
+# page is fetched for its session fields, then one logged-out message is sent and held
+# open until Gemini answers, two minutes at most. Error 1060 is Gemini declining this
+# address on a page that answers 200 — no status-code probe sees it — and one refusal
+# rotates at once. An answer that settles nothing is never grounds for a rotation; if
+# every answer settles nothing for three hours, the check has likely gone stale against
+# a change on Google's side, and the watchdog alerts once. About 1 MB a check. 0: off.
+GEMINI_CHECK=$GEMINI_CHECK
+# 1: the Gemini check fetches its page with curl-impersonate, installed by --impersonate
+# in $CI_DIR, so the request carries a browser's TLS handshake. Google
+# can flag an exit for browsers alone: Gemini then sends them to a captcha on
+# www.google.com, and where that host does not leave through this tunnel the captcha
+# cannot be solved. A redirect to it rotates at once. 0: plain curl, which that flag
+# lets through. Set it with --impersonate or --no-impersonate, which also install or
+# remove the build.
+IMPERSONATE=$IMPERSONATE
+# 1: the launcher turns Psiphon's server-sent tactics off, which keeps in-proxy (WebRTC
+# through a volunteer's device) out of the tunnel protocols. 0: Psiphon and its tactics
+# choose, as by default. Set with --inproxy / --no-inproxy.
+EXCLUDE_INPROXY=$EXCLUDE_INPROXY
 # Telegram alerts from the watchdog: a rotation (with its reason and the new exit), a
 # denied country the first time it is seen, a rotation that did not bring the tunnel
 # back. Sent directly, not through the tunnel. Both empty = off.
 # Test with: vps-psiphon notify-test
 TG_TOKEN='$TG_TOKEN'
 TG_CHAT='$TG_CHAT'
+# Forum topic inside that chat (message_thread_id). Empty = the chat itself.
+TG_THREAD='$TG_THREAD'
 # node_exporter textfile collector directory; the watchdog writes vps-psiphon.prom
 # there after every check. Empty = off.
 METRICS_DIR='$METRICS_DIR'
 EOF
 chmod 600 "$ENVF"
+# Removed only once the env file says IMPERSONATE=0: removed earlier, a run that fails
+# in between would leave a watchdog looking for a build that is gone.
+if [ "$IMPERSONATE" = 0 ] && [ -e "$CI_DIR" ]; then
+  rm -rf "${CI_DIR:?}" "${CI_DIR:?}.new" "${CI_DIR:?}.old"
+  say "curl-impersonate removed: --impersonate is off"
+fi
 
 case "$IMAGE" in
   *@sha256:*) : ;;
@@ -790,7 +1060,145 @@ cat > /usr/local/sbin/vps-psiphon-run <<'RUN'
 set -euo pipefail
 . /etc/default/vps-psiphon
 @@SHARED_FUNCS@@
+log() { printf 'vps-psiphon-run: %s\n' "$*" >&2; }
+# Fails closed. An empty BIND would publish "-p :1080:1080", which docker reads as every
+# interface: an open SOCKS5 proxy. The installer never writes one, a hand edit can; so
+# nothing starts unless the address and ports are what the installer would write.
+if ! [[ "${BIND:-}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+  log "BIND='${BIND:-}' in /etc/default/vps-psiphon is not an IPv4 address — refusing to publish the proxy"
+  exit 1
+fi
+for p in "$SOCKS_PORT" "$HTTP_PORT"; do
+  [[ "$p" =~ ^[0-9]{1,5}$ ]] || { log "port '$p' in /etc/default/vps-psiphon is not a number — refusing to start"; exit 1; }
+done
 docker rm -f "$NAME" >/dev/null 2>&1 || true
+IMG="$(img_canon "$IMAGE")"
+
+cfg="${CONF_DIR}/psiphon.config"
+# Nothing in this part may stop the tunnel from starting: every step is checked, and a
+# step that fails (a full disk, a template in another shape) leaves the config as it was
+# and the start goes ahead. The launcher runs under set -e, and inside a function
+# called with || errexit is off, so each command carries its own || return 1.
+
+# The image writes psiphon.config only when it is absent, from its template plus the
+# ports and regions, and then never again. Seeded here from the same template, so the
+# first tunnel after an install, a rotation or `region` already carries the settings
+# below; the regions are written there, at every start. If the template cannot be read,
+# the image seeds the file as before and the settings apply from the next start.
+seed_config() {
+  rm -rf "$cfg.new" 2>/dev/null
+  docker run --rm --entrypoint cat "$IMG" /etc/psiphon/psiphon.config > "$cfg.new" 2>/dev/null || return 1
+  grep -q '"LocalSocksProxyPort"' "$cfg.new" || return 1
+  # A template cut short is not a config: its last line must close the object.
+  [ "$(grep -v '^[[:space:]]*$' "$cfg.new" | tail -1 | tr -d '[:space:]')" = "}" ] || return 1
+  sed -i -E \
+    -e "s/\"LocalHttpProxyPort\"[[:space:]]*:[[:space:]]*[0-9]+/\"LocalHttpProxyPort\": ${HTTP_PORT}/" \
+    -e "s/\"LocalSocksProxyPort\"[[:space:]]*:[[:space:]]*[0-9]+/\"LocalSocksProxyPort\": ${SOCKS_PORT}/" \
+    "$cfg.new" || return 1
+  if command -v jq >/dev/null 2>&1; then jq -e . "$cfg.new" >/dev/null 2>&1 || return 1; fi
+  chown 1000:1000 "$cfg.new" 2>/dev/null || true
+  mv "$cfg.new" "$cfg" || return 1
+}
+# A config that is not JSON at all stops Psiphon on every start, and the image never
+# rewrites a file that exists. Where jq can tell, such a file is moved aside (kept, for
+# whoever wants to see it) and seeded afresh; the server list lives in the datastore, not
+# here, so nothing is lost.
+if [ -f "$cfg" ] && command -v jq >/dev/null 2>&1 && ! jq -e . "$cfg" >/dev/null 2>&1; then
+  if mv -f "$cfg" "$cfg.broken" 2>/dev/null; then
+    log "psiphon.config was not valid JSON — moved to psiphon.config.broken, seeding a fresh one"
+  fi
+fi
+if [ ! -f "$cfg" ]; then
+  seed_config || log "could not seed psiphon.config from the image — the image seeds it during this start"
+fi
+rm -rf "$cfg.new" 2>/dev/null || true
+
+# Psiphon's servers send every client tactics: settings for the client's network,
+# applied on top of this file. They put in-proxy first: the first dials of every tunnel
+# go through a volunteer's device over WebRTC, which is built for users whose networks
+# block Psiphon's servers. An exit carries a whole host's traffic, and through a
+# volunteer's link such a tunnel almost always died within minutes or crawled at a few
+# hundred KB/s, while a direct one carried megabytes a second for hours; each rotation
+# drew in-proxy again (measured by vps-psiphon, whose finding this is).
+#
+# "DisableTactics": true is the whole fix. Every INPROXY-WEBRTC protocol is disabled by
+# default in tunnel-core (DefaultDisabledTunnelProtocols), and with no protocol limit
+# the client never selects a default-disabled one; only tactics can enable them, and
+# with tactics off the client applies none, not even stored ones, and has no in-proxy
+# broker to dial. Upstream also writes a LimitTunnelProtocols list; it names exactly the
+# default-enabled set, so it adds nothing — and it is the one setting that can stop the
+# client from starting, which refuses a protocol name its build does not know. It is
+# not written here, and a list in the form this launcher (or upstream's) writes is
+# removed.
+#
+# The launcher owns lines in exactly the form it writes — one space of indent, one line,
+# a trailing comma — and touches no other line, so a value someone wrote by hand in
+# any other form is left alone.
+mode=psiphon-default
+[ "${EXCLUDE_INPROXY:-1}" = 1 ] && mode=no-inproxy
+# The regions come from the env file at every start, an empty one written as empty, which
+# Psiphon reads as any country. The image's template says "SG" and "IN" and the image
+# replaces them only with a value that is not empty, so "auto" used to exit through
+# Singapore — and a config seeded by an older version still says so until this rewrites
+# it. Only a value in the form the installer writes (two capital letters, or nothing) is
+# written; a hand edit in any other form leaves the file's value as it is, and says so.
+for v in EGRESS_REGION DEVICE_REGION; do
+  if ! [[ "${!v:-}" =~ ^([A-Z]{2})?$ ]]; then
+    # Written as any country rather than left to the template's SG and IN, which every
+    # fresh start would bring back.
+    log "$v='${!v}' in /etc/default/vps-psiphon is not a two-letter code — written as empty (any country)"
+    printf -v "$v" ''
+  fi
+done
+#
+# Psiphon's window per connection, in 32 KB blocks. Its default, 4 (128 KB), caps one
+# connection at about a window per round trip — ~20 Mbit/s over a 30 ms tunnel, however
+# idle the tunnel is. 32 (1 MB) measured 5-14x faster per connection with no added wait
+# for a small request behind eight downloads; 64 and 128 began to delay it (measured by
+# vps-psiphon, whose setting this is). An owned line, as DisableTactics is below.
+WINDOW=32
+edit_config() {
+  rm -rf "$cfg.edit" 2>/dev/null
+  cp "$cfg" "$cfg.edit" || return 1
+  sed -i -E \
+    -e "s/\"EgressRegion\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"EgressRegion\": \"${EGRESS_REGION:-}\"/" \
+    -e "s/\"DeviceRegion\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"DeviceRegion\": \"${DEVICE_REGION:-}\"/" \
+    -e '/^ "SSHChannelWindowSize": [0-9]+,$/d' \
+    "$cfg.edit" || return 1
+  sed -i "0,/{/s/{/{\n \"SSHChannelWindowSize\": $WINDOW,/" "$cfg.edit" || return 1
+  [ "$(grep -c "^ \"SSHChannelWindowSize\": $WINDOW,\$" "$cfg.edit")" = 1 ] || return 1
+  sed -i -E -e '/^ "DisableTactics": (true|false),$/d' \
+            -e '/^ "LimitTunnelProtocols": \[[^]]*\],$/d' "$cfg.edit" || return 1
+  if [ "$mode" = no-inproxy ]; then
+    sed -i '0,/{/s/{/{\n "DisableTactics": true,\n/' "$cfg.edit" || return 1
+    sed -i '/^$/d' "$cfg.edit" || return 1
+    [ "$(grep -c '^ "DisableTactics": true,$' "$cfg.edit")" = 1 ] || return 1
+  fi
+  grep -q '"LocalSocksProxyPort"' "$cfg.edit" || return 1
+  if command -v jq >/dev/null 2>&1; then jq -e . "$cfg.edit" >/dev/null 2>&1 || return 1; fi
+  # Unchanged is left unwritten, so the file is not rewritten on every start.
+  if cmp -s "$cfg" "$cfg.edit"; then rm -f "$cfg.edit"; return 0; fi
+  chown --reference="$cfg" "$cfg.edit" 2>/dev/null || true
+  mv -f "$cfg.edit" "$cfg" || return 1
+}
+if [ -f "$cfg" ]; then
+  if ! edit_config; then
+    rm -rf "$cfg.edit" 2>/dev/null || true
+    mode=unedited
+    log "could not edit psiphon.config (not in the shape this launcher edits, or a step failed) — started as it is, in-proxy NOT excluded"
+  elif [ "$mode" = no-inproxy ] && grep -qE '"DisableTactics"[[:space:]]*:[[:space:]]*false' "$cfg"; then
+    # Written by hand in another form, and left alone — but a later key wins in Go's
+    # JSON, so tactics are on and in-proxy is not kept out; reported, not overruled.
+    mode=overridden
+    log "psiphon.config sets \"DisableTactics\": false itself — tactics stay on, in-proxy NOT excluded"
+  fi
+elif [ "$mode" = no-inproxy ]; then
+  # The image seeds the file during this start; the setting applies from the next.
+  mode=pending
+fi
+# What this start did, for `vps-psiphon status` and the watchdog.
+printf '%s %s\n' "$(date +%s)" "$mode" > /var/lib/vps-psiphon-run.state 2>/dev/null || true
+
 # NOTE: the BIND prefix is load-bearing. Publishing without it exposes an OPEN SOCKS5
 # PROXY to the internet — psiphon binds 0.0.0.0 inside the container. Both addresses
 # this installer picks on its own are host-private; a --bind you typed yourself is
@@ -808,7 +1216,7 @@ exec docker run --rm --name "$NAME" \
   -e SOCKS_PORT="$SOCKS_PORT" -e HTTP_PORT="$HTTP_PORT" \
   -e DEVICE_REGION="$DEVICE_REGION" -e EGRESS_REGION="$EGRESS_REGION" \
   -v "${CONF_DIR}:/config" \
-  "$(img_canon "$IMAGE")"
+  "$IMG"
 RUN
 put_shared_funcs /usr/local/sbin/vps-psiphon-run
 chmod 755 /usr/local/sbin/vps-psiphon-run
@@ -816,16 +1224,16 @@ chmod 755 /usr/local/sbin/vps-psiphon-run
 # ---- region pool ------------------------------------------------------------
 cat > /usr/local/sbin/vps-psiphon-advance-region <<'ADV'
 #!/usr/bin/env bash
-# Advance EGRESS_REGION to the next country in REGION_POOL and apply it. Prints
-# "old -> new" when it changes anything, silent when there is no pool.
+# Advance EGRESS_REGION to the next country in REGION_POOL. Prints "old -> new" when it
+# changes anything, silent when there is no pool.
 #
 # Rotating within one country retries exactly the servers that are exhausted when it
 # is busy; walking a pool draws on another country instead, without handing the choice
 # to "auto", which may answer from another continent.
 #
-# Applied by rewriting psiphon.config in place — the image seeds that file only when
-# absent, so the edit sticks. Deliberately gentler than the `region` subcommand, which
-# wipes the config directory and the client's cached server list with it.
+# Only the env file is edited. Both callers, the watchdog and `vps-psiphon rotate`, then
+# start the client on an empty config directory, and the launcher writes the region
+# from the env file into psiphon.config at every start.
 set -uo pipefail
 ENVF=/etc/default/vps-psiphon
 # shellcheck source=/dev/null
@@ -834,6 +1242,9 @@ ENVF=/etc/default/vps-psiphon
 
 cur="${EGRESS_REGION:-}"; first=""; nxt=""; take=0
 for r in $REGION_POOL; do
+  # The pool is edited by hand too; a value the installer would not write is skipped,
+  # not copied into EGRESS_REGION, where the launcher would refuse it at every start.
+  [[ "$r" =~ ^[A-Z]{2}$ ]] || continue
   [ -z "$first" ] && first="$r"
   if [ "$take" = 1 ]; then nxt="$r"; break; fi
   [ "$r" = "$cur" ] && take=1
@@ -841,14 +1252,157 @@ done
 # Not in the pool (hand-edited, or the pool changed under us) falls to the first
 # entry, which is also what makes the last entry wrap around.
 [ -n "$nxt" ] || nxt="$first"
+[ -n "$nxt" ] || exit 0   # no usable country in the pool at all
 [ "$nxt" = "$cur" ] && exit 0
 
 sed -i "s/^EGRESS_REGION=.*/EGRESS_REGION=$nxt/" "$ENVF"
-cfg="${CONF_DIR:-/opt/vps-psiphon/config}/psiphon.config"
-[ -f "$cfg" ] && sed -i -E "s/\"EgressRegion\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"EgressRegion\": \"$nxt\"/" "$cfg"
 printf '%s -> %s\n' "${cur:-auto}" "$nxt"
 ADV
 chmod 0755 /usr/local/sbin/vps-psiphon-advance-region
+
+# ---- gemini check -----------------------------------------------------------
+# Ported from vps-psiphon 1.2 (Chara-Freedom), whose measurements the comments cite.
+cat > /usr/local/sbin/vps-psiphon-gemini-check <<'GEM'
+#!/usr/bin/env bash
+# Asks Gemini itself whether it serves this exit, and prints one line:
+#   exit 0  ok            Gemini replied; the line names the place it puts us in, when
+#                         Gemini names one
+#   exit 1  REFUSED       error 1060: Gemini declines this address
+#   exit 2  inconclusive  anything else — never grounds for a rotation
+#   exit 3  CAPTCHA       with IMPERSONATE=1 only: Google sends a browser on this exit to
+#                         its captcha on www.google.com/sorry
+# Logged out: the page is fetched for its session fields and cookies, then one message
+# is sent and held open until Gemini answers (two minutes at most). The page answers
+# 200 even where Gemini refuses the address, which is why a status-code probe cannot
+# see a refusal and this asks.
+#
+# With IMPERSONATE=1 the page is fetched by curl-impersonate as the newest Chrome it
+# knows. Google can flag an exit for browsers alone: on one such exit every browser
+# handshake (Chrome, Firefox, Safari) was redirected to the captcha, with or without a
+# browser's headers, while plain curl got the page, with or without them — the
+# handshake decides. The message itself still goes by plain curl.
+#
+#   --direct  probe from this host's own address instead of through the tunnel, to
+#             tell a burned exit apart from a refusal that follows the whole host.
+set -uo pipefail
+# shellcheck source=/dev/null
+[ -r /etc/default/vps-psiphon ] && . /etc/default/vps-psiphon
+P=(--socks5-hostname "${BIND:-127.0.0.1}:${SOCKS_PORT:-1080}")
+[ "${1:-}" = --direct ] && P=(-4)
+UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'
+d="$(mktemp -d)" || { echo "inconclusive (no temp dir)"; exit 2; }
+trap 'rm -rf "$d"' EXIT
+C=(-s "${P[@]}" -A "$UA" -H 'Accept-Language: en-US,en;q=0.9' -b "$d/jar" -c "$d/jar")
+
+# The browser build sends its own coherent headers, so it gets no -A or -H of ours.
+G=(curl "${C[@]}"); imp=0; note=""
+if [ "${IMPERSONATE:-0}" = 1 ]; then
+  ci=/opt/vps-psiphon/curl-impersonate
+  n="$(find "$ci" -maxdepth 1 -name 'curl_chrome*' 2>/dev/null \
+       | sed -n 's#^.*/curl_chrome\([0-9][0-9]*\)$#\1#p' | sort -n | tail -1)"
+  if [ -n "$n" ] && [ -x "$ci/curl-impersonate" ]; then
+    G=("$ci/curl_chrome$n" -s "${P[@]}" -b "$d/jar" -c "$d/jar"); imp=1
+  else
+    note=" (impersonate is on, but no curl-impersonate build is installed: the page went by plain curl)"
+  fi
+fi
+
+code="$("${G[@]}" --max-time 30 -o "$d/app" -D "$d/head" -w '%{http_code}' https://gemini.google.com/app 2>/dev/null || true)"
+if [ "$imp" = 1 ] && [ "$code" = 302 ] &&
+   grep -qiE '^location: *https://([a-z0-9-]+\.)*google\.[a-z]{2,3}(\.[a-z]{2})?/sorry/' "$d/head" 2>/dev/null; then
+  echo "CAPTCHA — Google sends a browser on this exit to /sorry, Gemini not asked"; exit 3
+fi
+bl="$(grep -oE '"cfb2h":"[^"]+"' "$d/app" 2>/dev/null | head -1 | cut -d'"' -f4)"
+sid="$(grep -oE '"FdrFJe":"[^"]+"' "$d/app" 2>/dev/null | head -1 | cut -d'"' -f4)"
+if [ -z "$bl" ] || [ -z "$sid" ]; then
+  echo "inconclusive (page answered ${code:-nothing}, without the session fields)$note"; exit 2
+fi
+# Both go into a URL: anything but the plain characters Google uses is a page this does
+# not understand, not something to pass on.
+if printf '%s\n%s\n' "$bl" "$sid" | grep -qvxE '[A-Za-z0-9._-]+'; then
+  echo "inconclusive (the session fields are not in the form this check knows)$note"; exit 2
+fi
+
+U='https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate'
+H=(-H 'Content-Type: application/x-www-form-urlencoded;charset=utf-8'
+   -H 'Origin: https://gemini.google.com' -H 'Referer: https://gemini.google.com/' -H 'X-Same-Domain: 1')
+Q="$U?bl=${bl}&f.sid=${sid}&hl=en&_reqid=$(( RANDOM * 10 + 100000 ))&rt=c"
+M='f.req=[null,"[[\"hi\"],null,null]"]'
+
+# Gemini can take a minute or more to answer, while Psiphon's servers close a connection
+# on which no byte has moved for 30 s. So a second request rides the same HTTP/2
+# connection and keeps it busy: its body trickles one byte every 2 s until the message's
+# transfer is over (its -w line goes to stderr, unbuffered, into $d/w). Google answers
+# that request 400 once its body ends, and the answer is discarded.
+#
+# That needs a curl with --parallel (7.66) and HTTP/2. Without them the message goes
+# alone: a refusal that arrives inside 30 s is still read, a slower answer is lost, and
+# the line says so — an older curl must cost precision, not the whole check.
+# Read into variables, not piped into grep -q: grep stops at the first match, curl then
+# dies of SIGPIPE, and under pipefail the match reads as a miss.
+ch="$( { curl --help all; curl --help; } 2>/dev/null )"; cv="$(curl -V 2>/dev/null)"
+if [[ "$ch" == *--parallel* ]] && [[ "$cv" == *HTTP2* ]]; then
+  i=0
+  # Once curl is done the pipe is closed: the next byte would fail with "write error:
+  # Broken pipe" on stderr, so a failed write ends the trickle, quietly.
+  while ! grep -q message-done "$d/w" 2>/dev/null && [ "$i" -lt 60 ]; do
+    sleep 2; printf x 2>/dev/null || break; i=$((i + 1))
+  done |
+    curl --parallel "${C[@]}" "${H[@]}" --max-time 130 -o "$d/out" -w '%{stderr}message-done' \
+      --data-urlencode "$M" "$Q" \
+      --next "${C[@]}" "${H[@]}" -X POST -T - --max-time 130 -o /dev/null \
+      -w '%{stderr}\nkeepalive-done %{http_code} %{time_total}\n' "$U?rt=c" \
+      >/dev/null 2>"$d/w"
+  # The keep-alive request is meant to end with the message. If it ended first — Google
+  # answered it before its body was over — the hold did not hold, and an answer that
+  # then never came says why.
+  if ! grep -q message-done "$d/w" 2>/dev/null || [ "$(grep -o 'keepalive-done\|message-done' "$d/w" | head -1)" = keepalive-done ]; then
+    ka="$(grep -o 'keepalive-done [0-9]* [0-9.]*' "$d/w" 2>/dev/null | head -1)"
+    [ -n "$ka" ] && note="$note (the keep-alive request ended before the answer: HTTP $(echo "$ka" | cut -d' ' -f2) after $(echo "$ka" | cut -d' ' -f3)s)"
+  fi
+else
+  curl "${C[@]}" "${H[@]}" --max-time 130 -o "$d/out" --data-urlencode "$M" "$Q" >/dev/null 2>&1
+  note="$note (curl here cannot hold the answer open: one slower than Psiphon's 30 s idle cut is lost)"
+fi
+
+# 1060 decides first: a held answer can open with a frame that is not a reply. Served
+# means a reply that names the place; 1096 trails every logged-out reply and says
+# nothing. The code opens the error's array: once a bare [1060], now [1060,null,"…"].
+errs="$(grep -oE 'BardErrorInfo",\[[0-9]+' "$d/out" 2>/dev/null | grep -oE '[0-9]+' | sort -u | tr '\n' ' ')"
+case " $errs " in
+  *" 1060 "*) echo "REFUSED — Gemini declines this exit (error 1060, no reply)$note"; exit 1 ;;
+esac
+where="$(grep -oE '\\"[^"\\]+\\",\\"SWML_DESCRIPTION' "$d/out" 2>/dev/null | head -1 | cut -d'"' -f2 | tr -d '\\')"
+[ -n "$where" ] && { echo "ok — Gemini replies, and places this exit in $where$note"; exit 0; }
+# A reply is a response candidate ("rc_…") carrying text. Upstream asks for a place as
+# well, but Gemini does not name one everywhere: measured from a US datacenter on
+# 2026-11-05, it answered "Hello! How can I help you today?" with no place, run after
+# run — a served exit that a place rule calls inconclusive for good. A frame that is
+# not a reply (the conversation's ids, its title) still settles nothing. The reply's
+# head goes into the line, so an answer that is itself an error reads as one.
+said="$(grep -oE 'rc_[0-9a-f]+\\",\[\\"[^"\\]{1,60}' "$d/out" 2>/dev/null | tail -1 | sed 's/.*\[\\"//')"
+# A reply that reads like a refusal in words is not counted as served: Gemini's refusal
+# is error 1060, and a worded one is a form this check does not know, so it settles
+# nothing — and leaves the stale-check alert armed — rather than passing as ok.
+case "$(printf '%s' "$said" | tr '[:upper:]' '[:lower:]')" in
+  *"not available"*|*"available in your"*|*unavailable*|*"your region"*|*"your country"*)
+    echo "inconclusive (a reply that reads like a refusal: \"$said…\")$note"; exit 2 ;;
+esac
+[ -n "$said" ] && { echo "ok — Gemini replies (\"$said…\"), naming no place$note"; exit 0; }
+if grep -q '"wrb.fr",null,"\[' "$d/out" 2>/dev/null; then
+  echo "inconclusive (an answer without a reply${errs:+, error ${errs% }})$note"; exit 2
+fi
+# A message Google sends to its captcha gets a 302 page in place of an answer. Told apart
+# from silence in the log, but never a rotation: the message goes by plain curl, and a
+# captcha for curl's handshake says nothing about what a browser gets on this exit —
+# rotating on the browser's captcha is IMPERSONATE's job, above. (vps-psiphon 1.3.)
+if grep -qiE 'https://([a-z0-9-]+\.)*google\.[a-z]{2,3}(\.[a-z]{2})?/sorry/' "$d/out" 2>/dev/null; then
+  echo "inconclusive (the message was sent to /sorry${errs:+, error ${errs% }})$note"; exit 2
+fi
+echo "inconclusive (no reply${errs:+, error ${errs% }})$note"; exit 2
+GEM
+chmod 755 /usr/local/sbin/vps-psiphon-gemini-check
+
 # ---- watchdog ---------------------------------------------------------------
 cat > /usr/local/sbin/vps-psiphon-watchdog <<'WD'
 #!/usr/bin/env bash
@@ -880,10 +1434,28 @@ cat > /usr/local/sbin/vps-psiphon-watchdog <<'WD'
 #      exits per service: gemini.google.com answered 403 through an exit that YouTube
 #      judged healthy, fast and US, for hours, until a rotation was made by hand.
 #
-# Google's /sorry captcha is recorded but never rotates on its own: a human solves one
-# in seconds, and churning the tunnel over it costs more than it saves.
+#   7. Gemini refuses — GEMINI_CHECK=1 (the default): Gemini itself is asked at every
+#      check, since its answer about an exit can change while the tunnel lasts. Error
+#      1060 arrives on a page that answers 200, so trigger 6 never sees it. One refusal
+#      is decisive: it rotates without waiting for the failure window (the cooldown
+#      still applies). Ported from vps-psiphon, as is trigger 8.
+#   8. browser captcha — IMPERSONATE=1 only: the Gemini check's page, fetched with a
+#      browser's handshake, is redirected to www.google.com/sorry. Where that host
+#      leaves from another address, the captcha cannot be solved; decisive as well.
+#
+# Google's /sorry captcha for plain curl (below) is recorded but never rotates on its
+# own: a human solves one in seconds, and churning the tunnel over it costs more than
+# it saves.
+#
+# Failures belong to the tunnel they were counted on: a tunnel started by anything —
+# this watchdog, `rotate`, `region`, the installer, a crash — begins with an empty
+# window, and a check during which the tunnel restarted is not judged at all. Rotations
+# that keep not helping back off (ROTATE_COOLDOWN_MAX), and a Gemini check that keeps
+# settling nothing raises an alert, because a check that has gone stale against a change
+# on Google's side looks exactly like a healthy exit.
 set -uo pipefail
 . /etc/default/vps-psiphon
+@@SHARED_FUNCS@@
 LOG=/var/log/vps-psiphon-watchdog.log
 STATE=/var/lib/vps-psiphon-watchdog.state
 S=(--socks5-hostname "${BIND:-127.0.0.1}:${SOCKS_PORT}")
@@ -908,13 +1480,117 @@ notify() {
   printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$TG_TOKEN" \
     | curl -s -o /dev/null --max-time 10 -K - \
         --data-urlencode "chat_id=${TG_CHAT}" \
+        ${TG_THREAD:+--data-urlencode "message_thread_id=${TG_THREAD}"} \
         --data-urlencode "text=vps-psiphon @ $(hostname): $*" >/dev/null 2>&1 || true
 }
 
 fails=0; last_rotate=0; captcha=0; window=""; rotations=0; last_reason=""; denied_gl=""
-refused_seen=""
+refused_seen=""; tunnel=""; futile=0; backoff_seen=0; gem_streak=0; gem_stale_seen=0
+imp_missing_seen=0; run_mode_seen=""
 # shellcheck source=/dev/null
 [ -r "$STATE" ] && . "$STATE"
+# Everything comes back from a file that is sourced, and goes back into it. Each value
+# is held to the form this script writes, or starts over: a counter is a plain decimal
+# of at most 12 digits (a leading zero would read as octal, "08" as an error, and a huge
+# one would overflow into a cooldown that never ends); a flag is 0 or 1; the window is
+# a string of 0s and 1s. Nothing else is carried forward, so a bad value cannot repeat.
+for v in fails last_rotate rotations futile gem_streak; do
+  if [[ "${!v}" =~ ^[0-9]{1,12}$ ]]; then printf -v "$v" '%s' "$((10#${!v}))"; else printf -v "$v" 0; fi
+done
+for v in captcha backoff_seen gem_stale_seen imp_missing_seen; do
+  case "${!v}" in 0|1) : ;; *) printf -v "$v" 0 ;; esac
+done
+[[ "$window" =~ ^[01]{0,64}$ ]] || window=""
+[[ "$denied_gl" =~ ^([A-Z]{2})?$ ]] || denied_gl=""
+# A last rotation in the future — the clock stepped back, say — would hold every
+# rotation until the clock caught up; counted from now instead, it holds one cooldown.
+[ "$last_rotate" -gt "$(date +%s)" ] && last_rotate="$(date +%s)"
+# Tuning from the env file, held to sane numbers: a threshold of 0 would rotate a
+# healthy tunnel at every cooldown.
+[[ "${FAIL_THRESHOLD:-}" =~ ^[0-9]{1,3}$ ]] && [ "$((10#$FAIL_THRESHOLD))" -ge 1 ] && FAIL_THRESHOLD=$((10#$FAIL_THRESHOLD)) || FAIL_THRESHOLD=2
+[[ "${FAIL_WINDOW:-}" =~ ^[0-9]{1,2}$ ]] && [ "$((10#$FAIL_WINDOW))" -ge 1 ] && FAIL_WINDOW=$((10#$FAIL_WINDOW)) || FAIL_WINDOW=5
+[[ "${GEMINI_STALE_CHECKS:-}" =~ ^[0-9]{1,4}$ ]] && [ "$((10#$GEMINI_STALE_CHECKS))" -ge 1 ] && GEMINI_STALE_CHECKS=$((10#$GEMINI_STALE_CHECKS)) || GEMINI_STALE_CHECKS=18
+
+# %q: the reason carries spaces, quotes and parentheses, and this file is sourced.
+save_state() {
+  {
+    printf 'fails=%q\nlast_rotate=%q\ncaptcha=%q\nwindow=%q\nrotations=%q\n' \
+      "$fails" "$last_rotate" "$captcha" "$window" "$rotations"
+    printf 'last_reason=%q\ndenied_gl=%q\nrefused_seen=%q\ntunnel=%q\nfutile=%q\nbackoff_seen=%q\n' \
+      "$last_reason" "$denied_gl" "$refused_seen" "$this_tunnel" "$futile" "$backoff_seen"
+    printf 'gem_streak=%q\ngem_stale_seen=%q\nimp_missing_seen=%q\nrun_mode_seen=%q\n' \
+      "$gem_streak" "$gem_stale_seen" "$imp_missing_seen" "$run_mode_seen"
+  } > "$STATE"
+}
+
+# Every tunnel the client brings up, with its protocol: after a rotation, after the
+# client's own reconnect inside a running container, after any restart. The client
+# stores the parameters of each tunnel that connected, one record per server, with the
+# time it connected and its protocol; the record outlives the container. Each tunnel is
+# logged once; the first run after an install starts from the container's own start.
+# This is where the in-proxy exclusion shows: no INPROXY-WEBRTC-… line while it holds.
+SEEN=/var/lib/vps-psiphon-watchdog.seen
+DB="${CONF_DIR:-/opt/vps-psiphon/config}/ca.psiphon.PsiphonTunnel.tunnel-core/datastore/psiphon.boltdb"
+log_tunnels() {
+  local last="" max ts proto ns
+  [ -r "$SEEN" ] && last="$(cat "$SEEN" 2>/dev/null)"
+  # Nanoseconds since 1970 are 19 digits; anything longer would overflow, and a leading
+  # zero would read as octal. Either starts over from the container's start.
+  if [[ "$last" =~ ^[1-9][0-9]{0,18}$ ]]; then last=$((10#$last)); else last=""; fi
+  if ! [[ "$last" =~ ^[0-9]+$ ]]; then
+    # No container, no start time: `date -d ""` would read as midnight and log the day.
+    last="$(docker inspect -f '{{.State.StartedAt}}' "${NAME:-vps-psiphon}" 2>/dev/null)"
+    [ -n "$last" ] || return 0
+    last="$(date -d "$last" +%s%N 2>/dev/null)"
+    [[ "$last" =~ ^[0-9]+$ ]] || return 0
+    last=$(( last - 60000000000 ))
+  fi
+  [ -r "$DB" ] || return 0
+  max="$last"
+  # Times carry nanoseconds of varying length, so they are compared as numbers.
+  while read -r ns proto ts; do
+    [[ "$ns" =~ ^[1-9][0-9]{0,18}$ ]] || continue
+    [ "$ns" -gt "$last" ] || continue
+    log "tunnel up: $proto (dialled at $ts)"
+    [ "$ns" -gt "$max" ] && max="$ns"
+  done < <(grep -aoE '"LastUsedTimestamp":"[^"]+"[^{}]{0,600}"TunnelProtocol":"[A-Z0-9-]+"' "$DB" 2>/dev/null \
+             | sed -E 's/"LastUsedTimestamp":"([^"]+)".*"TunnelProtocol":"([^"]+)"/\1 \2/' | sort -u \
+             | while read -r ts proto; do
+                 printf '%s %s %s\n' "$(date -d "$ts" +%s%N 2>/dev/null || echo 0)" "$proto" "$ts"
+               done | sort -n)
+  printf '%s\n' "$max" > "$SEEN"
+}
+log_tunnels
+
+# The tunnel this check is about, by the container's start time.
+this_tunnel="$(docker inspect -f '{{.State.StartedAt}}' "${NAME:-vps-psiphon}" 2>/dev/null)"
+if [ "$tunnel" != "$this_tunnel" ]; then
+  # Whatever restarted it, the fresh tunnel starts from zero instead of inheriting a
+  # reading that was never its own: one slow check of its own would otherwise complete
+  # the old tunnel's window and rotate it away. It is a new exit, so the once-only
+  # alerts start over too. The cooldown and the back-off are about rotations, not
+  # tunnels, and carry on.
+  [ -n "$tunnel" ] && [ -n "$window" ] && log "new tunnel (started ${this_tunnel:-?}): the failure window starts over"
+  window=""; fails=0; denied_gl=""; refused_seen=""
+fi
+
+# What the launcher made of the last start (see vps-psiphon-run). "unedited" means it
+# could not read psiphon.config in the shape it edits, so in-proxy is NOT kept out: said
+# once, when it first happens.
+run_mode="$(awk '{print $2}' /var/lib/vps-psiphon-run.state 2>/dev/null)"
+if [ -n "$run_mode" ] && [ "$run_mode" != "$run_mode_seen" ]; then
+  if [ "$run_mode" = unedited ]; then
+    log "launcher could not edit psiphon.config: in-proxy is not excluded on this tunnel"
+    notify "the launcher could not edit psiphon.config (not in the shape it knows), so in-proxy is NOT kept out of this tunnel. See journalctl -u vps-psiphon and $CONF_DIR/psiphon.config"
+  elif [ "$run_mode" = pending ]; then
+    # The image seeded the config itself, so this tunnel runs on its template: in-proxy
+    # not kept out, auto as SG. Every rotation starts on an empty directory, so until
+    # the template can be read again (a changed image, say) no start ever catches up.
+    log "launcher could not seed psiphon.config from the image: in-proxy is not excluded on this tunnel"
+    notify "the launcher could not seed psiphon.config from the image's template, so this tunnel runs on the image's own config: in-proxy is NOT kept out, and auto exits through the template's SG. Every rotation repeats this. See journalctl -u vps-psiphon"
+  fi
+  run_mode_seen="$run_mode"
+fi
 
 alive=0
 # Retry once: a check that races tunnel establishment (boot, restart, rotate)
@@ -996,7 +1672,7 @@ else
   # judged. An unknown age (no docker, renamed container) reads as old rather than
   # young: disabling the gate on a failed lookup is the worse of the two mistakes.
   up_for=999999
-  started="$(docker inspect -f '{{.State.StartedAt}}' "${NAME:-vps-psiphon}" 2>/dev/null)"
+  started="$this_tunnel"
   [ -n "$started" ] && up_for=$(( $(date +%s) - $(date -d "$started" +%s 2>/dev/null || echo 0) ))
   # A tunnel that completes no HTTP transaction at all, seconds after SOCKS answered
   # the liveness probe, is broken — and it used to read as healthy, since a zero-byte
@@ -1065,12 +1741,75 @@ else
   captcha="$now_captcha"
 fi
 
+# Gemini itself (trigger 7, and 8 with IMPERSONATE=1). Asked whenever the tunnel carries
+# HTTP at all; a dead or stalled one answers nothing worth reading. Bounded from outside
+# as well as inside, so a hung transfer cannot hold the lock past the next check.
+decisive=0; gem=""; grc=""
+if [ "${GEMINI_CHECK:-1}" = 1 ] && [ "$alive" = 1 ] && [ "${ytcode:-000}" != 000 ]; then
+  gem="$(timeout 200 /usr/local/sbin/vps-psiphon-gemini-check 2>/dev/null)"; grc=$?
+  gem="${gem%%$'\n'*}"   # one line into the log, whatever the check printed
+  case "$grc" in
+    0|1|3) : ;;
+    124) grc=2; gem="inconclusive (the check ran past 200 s and was stopped)" ;;
+    *)   grc=2; gem="${gem:-inconclusive (the check printed nothing)}" ;;
+  esac
+  log "gemini: $gem"
+  if [ "$grc" = 1 ]; then
+    decisive=1
+    reason="gemini-refused (error 1060 — one refusal is decisive)${reason:+; also $reason}"
+  elif [ "$grc" = 3 ]; then
+    decisive=1
+    reason="google-captcha (a browser on this exit is sent to /sorry — decisive)${reason:+; also $reason}"
+  fi
+  # A check that settles nothing for three hours protects nothing. That is how the
+  # upstream check failed silently for days when Gemini changed the frame of its
+  # refusal: every refusal read as "inconclusive" and nothing rotated. Said once.
+  if [ "$grc" = 2 ]; then
+    gem_streak=$(( gem_streak + 1 ))
+    if [ "$gem_streak" -ge "${GEMINI_STALE_CHECKS:-18}" ] && [ "$gem_stale_seen" = 0 ]; then
+      gem_stale_seen=1
+      log "gemini check has settled nothing for $gem_streak checks in a row — refusals are not being detected"
+      notify "the Gemini check has settled nothing for $gem_streak checks in a row (last: $gem). Refusals are not being detected: Google may have changed its answer, or Gemini fails for this host. Compare: vps-psiphon gemini --direct"
+    fi
+  else
+    [ "$gem_stale_seen" = 1 ] && log "gemini check settles again: $gem"
+    gem_streak=0; gem_stale_seen=0
+  fi
+  # A build asked for and missing (a re-run could not fetch one) is said once.
+  # A build without a curl_chromeN wrapper watches nothing either: the check then goes by
+  # plain curl, exactly as with no build.
+  if [ "${IMPERSONATE:-0}" = 1 ] && { [ ! -x /opt/vps-psiphon/curl-impersonate/curl-impersonate ] ||
+       [ -z "$(find /opt/vps-psiphon/curl-impersonate -maxdepth 1 -regex '.*/curl_chrome[0-9]+' -print -quit 2>/dev/null)" ]; }; then
+    [ "$imp_missing_seen" = 0 ] \
+      && notify "IMPERSONATE=1, but no curl-impersonate build is installed: the browser captcha is not watched. Re-run the installer to fetch one."
+    imp_missing_seen=1
+  else
+    imp_missing_seen=0
+  fi
+fi
+
+# A restart during the check — the installer, `rotate`, `region`, a crash — leaves
+# readings that belong to neither tunnel, and judging them would rotate the fresh one
+# for nothing (or a decisive failure would). The readings are not counted; the state is
+# still saved — the once-only alerts already sent must stay sent — under the tunnel the
+# check began on, so the next check finds a new one and starts it clean.
+if [ "$this_tunnel" != "$(docker inspect -f '{{.State.StartedAt}}' "${NAME:-vps-psiphon}" 2>/dev/null)" ]; then
+  log "check not judged: the tunnel restarted during it${reason:+ (it read: $reason)}"
+  save_state
+  exit 0
+fi
+
 # Failures are counted over a window of recent checks. Consecutive ones are the wrong
 # unit: the tunnel that most needs rotating is degraded rather than dead, and it passes
 # every other check — which reset the counter and put rotation out of reach.
 if [ -z "$reason" ]; then
   [ "$fails" -gt 0 ] && log "recovered (exit $(curl -s --max-time 15 "${S[@]}" https://api.ipify.org 2>/dev/null), country ${gl:-?})"
   window="${window}0"
+  # A passing check ends a run of rotations that did not help.
+  if [ "$futile" -gt 0 ]; then
+    [ "$backoff_seen" = 1 ] && log "a check passes again after $futile rotations: the back-off is over"
+    futile=0; backoff_seen=0
+  fi
 else
   window="${window}1"
 fi
@@ -1084,16 +1823,40 @@ ones="${window//0/}"; fails="${#ones}"
 # Always record the rate: this is the history that makes a slow decline legible.
 [ -n "$kbps" ] && log "throughput ${kbps} KB/s (country ${gl:-?})"
 
+# The cooldown between rotations, backed off while rotations keep not helping: after
+# three in a row with no passing check between them, it doubles with each further one,
+# up to ROTATE_COOLDOWN_MAX. A fault that follows the host instead of the exit — Google
+# refusing the whole pool, an upstream outage, a check gone stale — would otherwise drop
+# every live connection on every cooldown, forever.
+cool="${ROTATE_COOLDOWN:-1800}"; cap="${ROTATE_COOLDOWN_MAX:-7200}"
+if [[ "$cool" =~ ^[0-9]{1,7}$ ]]; then cool=$((10#$cool)); else cool=1800; fi
+if [[ "$cap" =~ ^[0-9]{1,7}$ ]]; then cap=$((10#$cap)); else cap=7200; fi
+[ "$cap" -lt "$cool" ] && cap="$cool"
+cooldown_after() {
+  local c="$cool" k="$1"
+  while [ "$k" -ge 3 ] && [ "$c" -lt "$cap" ]; do c=$(( c * 2 )); k=$(( k - 1 )); done
+  [ "$c" -gt "$cap" ] && c="$cap"
+  printf '%s' "$c"
+}
+wait_s="$(cooldown_after "$futile")"
+
+# A decisive failure (Gemini's refusal, the browser captcha) does not wait for the
+# window; everything else needs FAIL_THRESHOLD of the last FAIL_WINDOW checks.
+due=0
+{ [ "$fails" -ge "${FAIL_THRESHOLD:-2}" ] || [ "$decisive" = 1 ]; } && due=1
 now=$(date +%s)
-if [ "$fails" -ge "${FAIL_THRESHOLD:-2}" ] && [ $((now - last_rotate)) -ge "${ROTATE_COOLDOWN:-1800}" ]; then
+if [ "$due" = 1 ] && [ $((now - last_rotate)) -ge "$wait_s" ]; then
   old="$(curl -s --max-time 15 "${S[@]}" https://api.ipify.org 2>/dev/null || echo '?')"
   log "rotating away from exit $old"
   moved="$(/usr/local/sbin/vps-psiphon-advance-region 2>/dev/null)"
   [ -n "$moved" ] && log "region $moved"
-  systemctl restart vps-psiphon.service
+  # On an empty config directory, or the client draws the same server again (see
+  # fresh_start in the installer).
+  fresh_start 2>>"$LOG"
   sleep 45
   new="$(curl -s --max-time 20 "${S[@]}" https://api.ipify.org 2>/dev/null || echo '?')"
   log "rotated: $old -> $new"
+  log_tunnels
   if [ -z "$new" ] || [ "$new" = '?' ]; then
     notify "rotated away from $old (${last_reason:-?}) — and the new tunnel does not answer yet"
   else
@@ -1101,11 +1864,21 @@ if [ "$fails" -ge "${FAIL_THRESHOLD:-2}" ] && [ $((now - last_rotate)) -ge "${RO
   fi
   # A refusal on the new exit is news again, so the once-only alerts start over.
   fails=0; window=""; last_rotate=$now; rotations=$((rotations + 1)); denied_gl=""; refused_seen=""
+  futile=$(( futile + 1 ))
+  if [ "$futile" -ge 3 ] && [ "$backoff_seen" = 0 ]; then
+    backoff_seen=1
+    log "$futile rotations in a row without a passing check: backing off, the next waits $(cooldown_after "$futile")s"
+    notify "$futile rotations in a row have not brought a passing check (last: ${last_reason:-?}). The fault likely follows this host rather than the exit, so rotations now back off: the next in $(cooldown_after "$futile")s, at most every ${cap}s."
+  fi
+  # The tunnel just started is the one the next check judges, and it starts clean.
+  this_tunnel="$(docker inspect -f '{{.State.StartedAt}}' "${NAME:-vps-psiphon}" 2>/dev/null)"
+elif [ "$due" = 1 ]; then
+  held="rotation due but held: $(( wait_s - (now - last_rotate) ))s of the ${wait_s}s cooldown left"
+  [ "$futile" -ge 3 ] && held="$held (backed off after $futile rotations that did not help)"
+  log "$held"
 fi
 
-# %q: the reason carries spaces, quotes and parentheses, and this file is sourced.
-printf 'fails=%s\nlast_rotate=%s\ncaptcha=%s\nwindow=%s\nrotations=%s\nlast_reason=%q\ndenied_gl=%s\nrefused_seen=%q\n' \
-  "$fails" "$last_rotate" "$captcha" "$window" "$rotations" "$last_reason" "$denied_gl" "$refused_seen" > "$STATE"
+save_state
 
 # node_exporter textfile collector. Written to a temporary file in the same directory
 # and renamed, so a scrape never reads half a file.
@@ -1138,6 +1911,20 @@ if [ -n "${METRICS_DIR:-}" ] && [ -d "$METRICS_DIR" ]; then
       echo '# HELP vps_psiphon_target_refused 1 if a PROBE_URLS target refused this exit (403/451) on the last check.'
       echo '# TYPE vps_psiphon_target_refused gauge'
       echo "vps_psiphon_target_refused $([ -n "$refused" ] && echo 1 || echo 0)"
+      if [ -n "$grc" ]; then
+        echo '# HELP vps_psiphon_gemini_result Last Gemini check: 0 ok, 1 refused (1060), 2 inconclusive, 3 browser captcha.'
+        echo '# TYPE vps_psiphon_gemini_result gauge'
+        echo "vps_psiphon_gemini_result $grc"
+      fi
+      echo '# HELP vps_psiphon_gemini_inconclusive_streak Gemini checks in a row that settled nothing.'
+      echo '# TYPE vps_psiphon_gemini_inconclusive_streak gauge'
+      echo "vps_psiphon_gemini_inconclusive_streak $gem_streak"
+      echo '# HELP vps_psiphon_rotation_cooldown_seconds Cooldown the next rotation waits, back-off included.'
+      echo '# TYPE vps_psiphon_rotation_cooldown_seconds gauge'
+      echo "vps_psiphon_rotation_cooldown_seconds $(cooldown_after "$futile")"
+      echo '# HELP vps_psiphon_inproxy_excluded 1 if the last start kept in-proxy out (tactics off).'
+      echo '# TYPE vps_psiphon_inproxy_excluded gauge'
+      echo "vps_psiphon_inproxy_excluded $([ "$run_mode" = no-inproxy ] && echo 1 || echo 0)"
       if [ -n "$gl" ]; then
         echo "# HELP vps_psiphon_country_info Google's country verdict about this exit."
         echo '# TYPE vps_psiphon_country_info gauge'
@@ -1150,6 +1937,7 @@ if [ -n "${METRICS_DIR:-}" ] && [ -d "$METRICS_DIR" ]; then
   }
 fi
 WD
+put_shared_funcs /usr/local/sbin/vps-psiphon-watchdog
 chmod 755 /usr/local/sbin/vps-psiphon-watchdog
 touch /var/log/vps-psiphon-watchdog.log
 # The watchdog appends a few lines every ten minutes, forever. copytruncate because it
@@ -1230,7 +2018,7 @@ rm_image() {
 # skips itself.
 take_lock() {
   exec 9>/run/vps-psiphon.lock
-  flock -w 300 9 || { echo "another vps-psiphon operation (installer, watchdog check or command) has held the lock for 5 minutes — try again" >&2; exit 1; }
+  flock -w 600 9 || { echo "another vps-psiphon operation (installer, watchdog check or command) has held the lock for 10 minutes — try again" >&2; exit 1; }
 }
 
 # Same sender as the watchdog's: direct, token kept out of argv.
@@ -1239,6 +2027,7 @@ notify() {
   printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$TG_TOKEN" \
     | curl -s -o /dev/null -w '%{http_code}' --max-time 10 -K - \
         --data-urlencode "chat_id=${TG_CHAT}" \
+        ${TG_THREAD:+--data-urlencode "message_thread_id=${TG_THREAD}"} \
         --data-urlencode "text=vps-psiphon @ $(hostname): $*" 2>/dev/null
 }
 
@@ -1303,6 +2092,33 @@ status() {
       *) echo "target    : $h ${pc:-000}   (not judged — only 403/451 rotate)" ;;
     esac
   done
+  # The watchdog's last reading, not a fresh one: asking Gemini takes up to two minutes.
+  # `vps-psiphon gemini` asks now.
+  if [ "${GEMINI_CHECK:-1}" = 1 ]; then
+    v="$(grep ' gemini: ' /var/log/vps-psiphon-watchdog.log 2>/dev/null | tail -1)"
+    if [ -n "$v" ]; then echo "gemini    : ${v#* gemini: }   (watchdog, ${v%% *})"
+    else echo "gemini    : not asked yet — the watchdog asks at every check; now: vps-psiphon gemini"; fi
+  else
+    echo "gemini    : not asked (--no-gemini-check)"
+  fi
+  if [ "${IMPERSONATE:-0}" = 1 ]; then
+    if [ -x /opt/vps-psiphon/curl-impersonate/curl-impersonate ]; then
+      echo "browsers  : captcha watched — Gemini's page is fetched as Chrome (curl-impersonate $(cat /opt/vps-psiphon/curl-impersonate/VERSION 2>/dev/null || echo '?'))"
+    else
+      echo "browsers  : captcha NOT watched — IMPERSONATE=1 but curl-impersonate is missing; re-run the installer"
+    fi
+  fi
+  # What the launcher made of the last start; "unedited" is the one to act on.
+  v="$(awk '{print $2}' /var/lib/vps-psiphon-run.state 2>/dev/null)"
+  case "$v" in
+    no-inproxy)      echo "protocols : in-proxy excluded (tactics off)" ;;
+    pending)         echo "protocols : in-proxy NOT excluded on this tunnel — the launcher could not seed psiphon.config from the image (journalctl -u vps-psiphon); every fresh start repeats it" ;;
+    unedited)        echo "protocols : in-proxy NOT excluded — psiphon.config is not in the shape the launcher edits (journalctl -u vps-psiphon)" ;;
+    overridden)      echo "protocols : in-proxy NOT excluded — psiphon.config sets \"DisableTactics\": false by hand" ;;
+    psiphon-default) echo "protocols : Psiphon's own choice (--inproxy)" ;;
+  esac
+  v="$(grep ' tunnel up: ' /var/log/vps-psiphon-watchdog.log 2>/dev/null | tail -1)"
+  [ -n "$v" ] && echo "last tunnel: ${v#* tunnel up: }"
   echo -n "traffic   : "; docker exec "$NAME" cat /proc/net/dev 2>/dev/null | awk '/eth0/{printf "rx %.2f GB / tx %.2f GB\n", $2/1e9, $10/1e9}' || echo 'n/a'
 }
 
@@ -1313,7 +2129,7 @@ case "${1:-status}" in
     echo "rotating (fresh tunnel, new exit)…"
     moved="$(/usr/local/sbin/vps-psiphon-advance-region 2>/dev/null)"
     [ -n "$moved" ] && echo "region    : $moved"
-    systemctl restart vps-psiphon.service; sleep 45
+    fresh_start; sleep 45
     # advance-region rewrote the env file; without re-reading it, status would judge
     # the new exit against the region we just left.
     [ -r /etc/default/vps-psiphon ] && . /etc/default/vps-psiphon
@@ -1369,10 +2185,8 @@ case "${1:-status}" in
     take_lock
     sed -i "s/^EGRESS_REGION=.*/EGRESS_REGION=$r/" /etc/default/vps-psiphon
     EGRESS_REGION="$r"   # the file was sourced at startup; keep status() honest
-    # The image seeds /config on first run only; an existing psiphon.config keeps the
-    # OLD region silently, so wipe it or the change is a no-op.
-    rm -rf "${CONF_DIR:?}"/*; mkdir -p "$CONF_DIR"; chown -R 1000:1000 "$CONF_DIR"
-    systemctl restart vps-psiphon.service; sleep 45; status ;;
+    # A new country is a new draw of servers, as every rotation is.
+    fresh_start; sleep 45; status ;;
   speed)
     U="https://speed.cloudflare.com/__down?bytes=50000000"
     echo -n "single 50MB : "
@@ -1386,6 +2200,11 @@ case "${1:-status}" in
     awk -v a="$t0" -v b="$t1" '{s+=$1} END{printf "%.1f Mbit/s aggregate\n", s*8/(b-a)/1e6}' "$tf"
     rm -f "$tf" ;;
   logs)     docker logs --tail "${2:-50}" "$NAME" ;;
+  gemini)
+    # The watchdog's own check, asked now. --direct asks from this host's address, to
+    # tell a burned exit from a refusal that follows the whole host.
+    case "${2:-}" in ''|--direct) ;; *) echo "usage: vps-psiphon gemini [--direct]" >&2; exit 1 ;; esac
+    /usr/local/sbin/vps-psiphon-gemini-check ${2:+"$2"} ;;
   notify-test)
     if [ -z "${TG_TOKEN:-}" ] || [ -z "${TG_CHAT:-}" ]; then
       echo "Telegram alerts are off: set them with the installer's --tg-token and --tg-chat" >&2
@@ -1591,7 +2410,8 @@ EOF
     # refuses while anything else references it, which is fine.
     rm_image "$IMAGE"
     rm -f /usr/local/sbin/vps-psiphon-run /usr/local/sbin/vps-psiphon-watchdog \
-          /usr/local/sbin/vps-psiphon-advance-region \
+          /usr/local/sbin/vps-psiphon-advance-region /usr/local/sbin/vps-psiphon-gemini-check \
+          /var/lib/vps-psiphon-watchdog.seen /var/lib/vps-psiphon-run.state \
           /etc/default/vps-psiphon /var/lib/vps-psiphon-watchdog.state \
           /var/log/vps-psiphon-watchdog.log /tmp/vpspsi.speed \
           /etc/logrotate.d/vps-psiphon
@@ -1604,7 +2424,8 @@ EOF
     left=""
     for p in /usr/local/sbin/vps-psiphon /usr/local/sbin/vps-psiphon-run \
              /usr/local/sbin/vps-psiphon-watchdog \
-             /usr/local/sbin/vps-psiphon-advance-region /etc/default/vps-psiphon \
+             /usr/local/sbin/vps-psiphon-advance-region /usr/local/sbin/vps-psiphon-gemini-check \
+             /var/lib/vps-psiphon-watchdog.seen /var/lib/vps-psiphon-run.state /etc/default/vps-psiphon \
              /etc/systemd/system/vps-psiphon.service \
              /etc/systemd/system/vps-psiphon-watchdog.service \
              /etc/systemd/system/vps-psiphon-watchdog.timer \
@@ -1618,7 +2439,7 @@ EOF
       && echo "note: image $(img_canon "$IMAGE") kept, something else on this host references it"
     [ -n "$left" ] && { echo "removed, but these remain:$left" >&2; exit 1; }
     echo "removed: units, container, image, config, state, log — and this CLI itself" ;;
-  *) echo "usage: vps-psiphon {status|verify|routing|rotate|region <CC|auto>|pool '<CC CC …>'|accept '<CC CC …>|any'|update-image [--check] [REF]|notify-test|speed|logs [n]|watchdog [n]|uninstall}" ;;
+  *) echo "usage: vps-psiphon {status|verify|routing|rotate|region <CC|auto>|pool '<CC CC …>'|accept '<CC CC …>|any'|update-image [--check] [REF]|gemini [--direct]|notify-test|speed|logs [n]|watchdog [n]|uninstall}" ;;
 esac
 CLI
 # IMAGE is validated to [A-Za-z0-9._/:@-], so it cannot break out of the | delimiter.
@@ -1655,6 +2476,10 @@ After=vps-psiphon.service
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/vps-psiphon-watchdog
+# A check is a few minutes at worst — the Gemini check alone may take 200 s, a rotation
+# another 80. A oneshot that hangs is never started again by its timer, so it is cut
+# off rather than left to end the watchdog quietly.
+TimeoutStartSec=15min
 U2
 
 cat > /etc/systemd/system/vps-psiphon-watchdog.timer <<'U3'
@@ -1674,7 +2499,11 @@ systemctl daemon-reload
 systemctl enable vps-psiphon.service >/dev/null 2>&1
 # restart, not "enable --now": on a reinstall the service is already active and
 # would keep running with the previous parameters.
-systemctl restart vps-psiphon.service
+if [ "$REGION_CHANGED" = 1 ]; then
+  fresh_start || true   # on a CONF_DIR it would not empty it restarts, and says why
+else
+  systemctl restart vps-psiphon.service
+fi
 [ "$WATCHDOG" = 1 ] && systemctl enable --now vps-psiphon-watchdog.timer
 
 # ------------------------------------------------------------------- verify --
@@ -1721,4 +2550,4 @@ if [ "${BIND_CHANGED:-0}" = 1 ]; then
   printf '\033[1;33m    !! this run MOVED the address (%s -> %s), so the outbound above is\n' "$OLD_BIND" "$BIND"
   printf '       NOT what your panel has. Update it now, or the tunnel carries nothing.\033[0m\n'
 fi
-say "manage with:  vps-psiphon {status|verify|routing|rotate|region <CC>|pool '<CC CC …>'|accept '<CC CC …>'|update-image|notify-test|speed|logs|uninstall}"
+say "manage with:  vps-psiphon {status|verify|routing|rotate|region <CC>|pool '<CC CC …>'|accept '<CC CC …>'|update-image|gemini|notify-test|speed|logs|uninstall}"
