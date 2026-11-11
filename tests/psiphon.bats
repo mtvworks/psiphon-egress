@@ -195,6 +195,13 @@ teardown() { teardown_root; }
   refute grep -q 'check failed' "$WDLOG"
 }
 
+@test "watchdog: recovery is logged once, not on every pass while the failure is in the window" {
+  FAKE_YT_W="1000 200" FAKE_YT_RC=28 FAKE_YT_BODY='"GL":"DE"' run_watchdog
+  wd_log | grep -q 'check failed (slow-tunnel'
+  run_watchdog; run_watchdog   # the second pass still has the failure in its window
+  [ "$(grep -c 'recovered' "$WDLOG")" -eq 1 ]
+}
+
 @test "watchdog: denied country alerts once, then rotates and alerts again" {
   export FAKE_YT_BODY='"GL":"RU"'
   run_watchdog

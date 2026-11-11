@@ -1494,7 +1494,7 @@ imp_missing_seen=0; run_mode_seen=""
 # of at most 12 digits (a leading zero would read as octal, "08" as an error, and a huge
 # one would overflow into a cooldown that never ends); a flag is 0 or 1; the window is
 # a string of 0s and 1s. Nothing else is carried forward, so a bad value cannot repeat.
-for v in fails last_rotate rotations futile gem_streak; do
+for v in last_rotate rotations futile gem_streak; do
   if [[ "${!v}" =~ ^[0-9]{1,12}$ ]]; then printf -v "$v" '%s' "$((10#${!v}))"; else printf -v "$v" 0; fi
 done
 for v in captcha backoff_seen gem_stale_seen imp_missing_seen; do
@@ -1514,8 +1514,9 @@ done
 # %q: the reason carries spaces, quotes and parentheses, and this file is sourced.
 save_state() {
   {
-    printf 'fails=%q\nlast_rotate=%q\ncaptcha=%q\nwindow=%q\nrotations=%q\n' \
-      "$fails" "$last_rotate" "$captcha" "$window" "$rotations"
+    # No fails: it is always counted afresh from the window.
+    printf 'last_rotate=%q\ncaptcha=%q\nwindow=%q\nrotations=%q\n' \
+      "$last_rotate" "$captcha" "$window" "$rotations"
     printf 'last_reason=%q\ndenied_gl=%q\nrefused_seen=%q\ntunnel=%q\nfutile=%q\nbackoff_seen=%q\n' \
       "$last_reason" "$denied_gl" "$refused_seen" "$this_tunnel" "$futile" "$backoff_seen"
     printf 'gem_streak=%q\ngem_stale_seen=%q\nimp_missing_seen=%q\nrun_mode_seen=%q\n' \
@@ -1571,7 +1572,7 @@ if [ "$tunnel" != "$this_tunnel" ]; then
   # alerts start over too. The cooldown and the back-off are about rotations, not
   # tunnels, and carry on.
   [ -n "$tunnel" ] && [ -n "$window" ] && log "new tunnel (started ${this_tunnel:-?}): the failure window starts over"
-  window=""; fails=0; denied_gl=""; refused_seen=""
+  window=""; denied_gl=""; refused_seen=""
 fi
 
 # What the launcher made of the last start (see vps-psiphon-run). "unedited" means it
@@ -1803,7 +1804,9 @@ fi
 # unit: the tunnel that most needs rotating is degraded rather than dead, and it passes
 # every other check — which reset the counter and put rotation out of reach.
 if [ -z "$reason" ]; then
-  [ "$fails" -gt 0 ] && log "recovered (exit $(curl -s --max-time 15 "${S[@]}" https://api.ipify.org 2>/dev/null), country ${gl:-?})"
+  # Recovery is the first pass after a failed check, said once — not every pass while
+  # an older failure still sits in the window.
+  [ "${window: -1}" = 1 ] && log "recovered (exit $(curl -s --max-time 15 "${S[@]}" https://api.ipify.org 2>/dev/null), country ${gl:-?})"
   window="${window}0"
   # A passing check ends a run of rotations that did not help.
   if [ "$futile" -gt 0 ]; then
