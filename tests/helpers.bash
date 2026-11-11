@@ -241,3 +241,12 @@ psiphon_template() {
 }
 T
 }
+
+# Any start of the tunnel at all — a plain restart or a fresh start — is a rotation in
+# the watchdog's tests; a fresh one is the client on an empty config directory.
+rotated() { grep -qE '^systemctl (restart|start) vps-psiphon.service$' "$STUB_LOG"; }
+rotated_fresh() {
+  grep -qx 'systemctl stop vps-psiphon.service' "$STUB_LOG" &&
+    grep -qx 'systemctl start vps-psiphon.service' "$STUB_LOG" &&
+    refute grep -qx 'systemctl restart vps-psiphon.service' "$STUB_LOG"
+}

@@ -103,7 +103,7 @@ A status code cannot see Gemini's own geo-check: where Gemini declines an
 address, its page still answers **200**, and the refusal — error **1060**,
 "Gemini isn't available in your region yet" — only arrives in the answer to a
 message. So at every check the watchdog runs `vps-psiphon-gemini-check`, ported
-from [vps-psiphon](https://github.com/Chara-Freedom/vps-psiphon) 1.2:
+from [vps-psiphon](https://github.com/Chara-Freedom/vps-psiphon) 1.2–1.3:
 
 1. fetch `gemini.google.com/app` through the tunnel for its session fields;
 2. send one logged-out message and hold the answer open — Gemini can take a
@@ -146,6 +146,9 @@ page through the same exit, so no check sees it.
 `--impersonate` installs [curl-impersonate](https://github.com/lexiforest/curl-impersonate)
 under `/opt/vps-psiphon/curl-impersonate`, and the Gemini check fetches its page
 as the newest Chrome the build knows; a redirect to `/sorry` rotates at once.
+The message itself still goes by plain curl, so a message Google sends to
+`/sorry` is logged as `inconclusive (the message was sent to /sorry)` and never
+rotates: a captcha for curl's handshake says nothing about what a browser gets.
 The latest release is checked against the sha256 GitHub publishes for it; if
 that cannot be read or fails, a pinned release (v2.3.2, digests in the
 installer) is taken. A first install with `--impersonate` stops before changing
@@ -187,9 +190,22 @@ moved to `psiphon.config.broken` and seeded afresh. The one thing the launcher
 refuses is an address or port the installer would not write: an empty `BIND`
 in a hand-edited env file would publish the SOCKS on every interface — an open
 proxy — so it does not start at all.
-A fresh config also gets `"EgressRegion": ""` for auto: the image's template
-says `SG` and replaces it only when a region is set, so auto used to mean
-Singapore.
+The regions are written from the env file at every start, auto as
+`"EgressRegion": ""`: the image's template says `SG` and replaces it only when a
+region is set, so auto used to mean Singapore — and a config written before
+kept saying so. A value in the env file that is not a two-letter code is not
+written; the launcher says so and starts anyway.
+
+## Every rotation is a fresh draw
+
+The client keeps the servers it knows in its config directory, and a plain
+restart kept bringing it back to the same server in the country: in
+vps-psiphon's journal, 13 rotations into one country over two days all came
+back to one server, and a pool of four countries kept landing on the same four
+exits. So every rotation — the watchdog's and `vps-psiphon rotate` — and
+`region` stop the client, empty `/opt/vps-psiphon/config` and start it again;
+the launcher seeds `psiphon.config` from the image's template and the env file.
+`advance-region` only edits the env file. (Ported from vps-psiphon 1.3.)
 
 ## When rotations do not help
 
@@ -312,7 +328,7 @@ The watchdog log is rotated weekly through `/etc/logrotate.d/vps-psiphon`.
 | **Reinstall keeps state** | region, published address, container ceilings, image, tuning and alerts survive a re-run instead of silently resetting. |
 | **Watchdog fixes** | a timed-out transfer is judged as slow, not as a dead tunnel; `status` applies the deny-list like the watchdog does; one lock for the watchdog and manual commands. |
 | **Target checks** | the services the exit is for (`PROBE_URLS`) are fetched through it; a 403/451 rotates — Google refuses single exits per service while the other checks read green. |
-| **From upstream 1.2** | the Gemini check with the 1060 refusal and the held-open answer, `--impersonate`, the in-proxy exclusion with tactics off, failures counted per tunnel — see the sections above, and [CREDITS.md](CREDITS.md). |
+| **From upstream 1.2–1.3** | the Gemini check with the 1060 refusal and the held-open answer, `--impersonate`, the in-proxy exclusion with tactics off, failures counted per tunnel, a fresh draw of servers at every rotation, regions written at every start — see the sections above, and [CREDITS.md](CREDITS.md). |
 | **Fault tolerance around them** | a reply without a place counts as served; an older curl degrades the check instead of breaking it; a stale Gemini check alerts; in-proxy kept out by tactics off alone, without the protocol list that can stop the client; the launcher never fails a start over its own edits; back-off for futile rotations; curl-impersonate installed root-owned whatever the archive says; a reinstall is not blocked by a curl-impersonate download it did not ask for; the watchdog unit is cut off after 15 min instead of hanging its timer. |
 | **`update-image`, alerts, metrics** | moving the digest pin in the open; Telegram alerts; node_exporter metrics; log rotation. |
 | **Tests and CI** | `bats tests` and `tests/lint.sh` (shellcheck, generated scripts included) run on every push. |

@@ -8,7 +8,8 @@ tag="${1:?usage: render.sh RUN|ADV|GEM|WD|CLI}"
 # The installer defines them at the top level, one copy each.
 eval "$(sed -n '/^cc_list() {/,/^}/p' "$installer")"
 eval "$(sed -n '/^img_repo() /,/^}$/p' "$installer")"
-SHARED_FUNCS="$(declare -f cc_list img_repo img_tag img_tagged img_digest img_canon)"
+eval "$(sed -n '/^fresh_start() {/,/^}$/p' "$installer")"
+SHARED_FUNCS="$(declare -f cc_list img_repo img_tag img_tagged img_digest img_canon fresh_start)"
 export SHARED_FUNCS
 body="$(awk -v t="$tag" '$0 ~ "<<\x27"t"\x27$" {f=1; next} $0==t {f=0} f' "$installer")"
 [ -n "$body" ] || { echo "heredoc $tag not found in $installer" >&2; exit 1; }

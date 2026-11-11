@@ -20,7 +20,7 @@ drew exits that Google geolocates to **RU** — on a fast, healthy, perfectly
 reachable tunnel. For anyone running a VPN out of that country, such an exit is
 worse than no tunnel. Liveness probes call it healthy. This watchdog rotated it.
 
-### Ported later from upstream 1.0–1.2 (2026-10-26 … 2026-11-04)
+### Ported later from upstream 1.0–1.3 (2026-10-26 … 2026-11-11)
 
 We forked before upstream's Gemini check existed. These came over afterwards, with
 the author's measurements quoted in the comments where they justify a choice:
@@ -36,7 +36,11 @@ the author's measurements quoted in the comments where they justify a choice:
   names only the default-enabled protocols and is the one setting that can stop the
   client from starting;
 - **failures belong to the tunnel they were counted on**, and a check during which
-  the tunnel restarted is not judged.
+  the tunnel restarted is not judged;
+- from 1.3: **every rotation starts the client on an empty config directory**, so it
+  draws a server afresh instead of returning to the one it knows; **the regions are
+  written from the env file at every start**, so auto is no longer the template's
+  Singapore; and a message Google sends to `/sorry` is logged apart from silence.
 
 What we changed in them, and why, is in the README ("Asking Gemini itself", "In-proxy
 and Psiphon's tactics", "When rotations do not help"): a reply without a place counts

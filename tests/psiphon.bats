@@ -200,11 +200,11 @@ teardown() { teardown_root; }
   run_watchdog
   wd_log | grep -q 'denied-country'
   [ "$(grep -c '^TG .*seen as RU' "$STUB_LOG")" -eq 1 ]
-  refute grep -q 'systemctl restart' "$STUB_LOG"
+  refute rotated
 
   run_watchdog
   [ "$(grep -c '^TG .*seen as RU' "$STUB_LOG")" -eq 1 ]   # not repeated
-  grep -q 'systemctl restart vps-psiphon.service' "$STUB_LOG"
+  rotated_fresh
   grep -q '^TG .*rotated 203.0.113.9 -> 203.0.113.9, region DE -> NL (denied-country' "$STUB_LOG"
   grep -q '^EGRESS_REGION=NL$' "$ROOT/etc/default/vps-psiphon"
   grep -qx 'vps_psiphon_rotations_total 1' "$ROOT/metrics/vps-psiphon.prom"
@@ -221,11 +221,11 @@ teardown() { teardown_root; }
   [ "$(grep -c '^TG .*gemini.google.com 403 through this exit — rotating' "$STUB_LOG")" -eq 1 ]
   grep -qx 'vps_psiphon_target_refused 1' "$ROOT/metrics/vps-psiphon.prom"
   grep -qx 'vps_psiphon_check_ok 0' "$ROOT/metrics/vps-psiphon.prom"
-  refute grep -q 'systemctl restart' "$STUB_LOG"
+  refute rotated
 
   run_watchdog
   [ "$(grep -c '^TG .*403 through this exit — rotating' "$STUB_LOG")" -eq 1 ]   # not repeated
-  grep -q 'systemctl restart vps-psiphon.service' "$STUB_LOG"
+  rotated_fresh
   grep -q '^TG .*rotated 203.0.113.9 -> 203.0.113.9, region DE -> NL (refused-by-target (gemini.google.com 403' "$STUB_LOG"
   # Sourceable, and the once-only alert starts over for the new exit.
   bash -c ". '$ROOT/var/lib/vps-psiphon-watchdog.state'; [ -z \"\$refused_seen\" ] && [[ \"\$last_reason\" == refused-by-target* ]]"
@@ -412,12 +412,12 @@ $R:v2=id-other" FAKE_DIGESTS="$R@$NEW" run_cli update-image "$R:v3"
 
 @test "shared functions exist once, and the generated scripts get exactly those" {
   # One definition each in the installer — no hand-kept copy inside a heredoc.
-  for f in cc_list img_repo img_tag img_tagged img_digest img_canon; do
+  for f in cc_list img_repo img_tag img_tagged img_digest img_canon fresh_start; do
     [ "$(grep -c "^$f() " "$INSTALLER")" -eq 1 ]
   done
   # The placeholder the installer fills is present, and rendering leaves none behind.
-  [ "$(grep -c '^@@SHARED_FUNCS@@$' "$INSTALLER")" -eq 2 ]
-  for t in RUN CLI; do
+  [ "$(grep -c '^@@SHARED_FUNCS@@$' "$INSTALLER")" -eq 3 ]
+  for t in RUN WD CLI; do
     out="$(heredoc "$t")"
     refute grep -q '@@SHARED_FUNCS@@' <<<"$out"
     grep -q '^img_canon ()' <<<"$out"
@@ -501,6 +501,15 @@ GEM_ERROR_REPLY='[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],{\"11\":[\"Technical E
   # A held answer can open with a frame that is not a reply: 1060 still decides.
   FAKE_GEM_OUT='[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],null,null,[[\"rc_1\",[\"x\"]]],[\"Paris\",\"SWML_DESCRIPTION\"]]"]]'"$GEM_REFUSED_NEW" run_gem
   [ "$status" -eq 1 ]
+}
+
+@test "gemini: a message sent to /sorry is told apart from silence, and never a refusal" {
+  FAKE_GEM_OUT='<HTML><A HREF="https://www.google.com/sorry/index?continue=x">here</A>' run_gem
+  [ "$status" -eq 2 ]
+  [[ "$output" == "inconclusive (the message was sent to /sorry)" ]]
+  # Not Google's own host: only silence.
+  FAKE_GEM_OUT='<A HREF="https://google.com.evil.example/sorry/">' run_gem
+  [[ "$output" == "inconclusive (no reply)" ]]
 }
 
 @test "gemini: anything else is inconclusive and says why" {
@@ -590,15 +599,57 @@ GEM_ERROR_REPLY='[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],{\"11\":[\"Technical E
   run_watchdog
   wd_log | grep -q 'gemini: REFUSED'
   wd_log | grep -q 'check failed (gemini-refused (error 1060'
-  grep -q 'systemctl restart vps-psiphon.service' "$STUB_LOG"
+  rotated_fresh
   grep -q '^TG .*rotated .*(gemini-refused' "$STUB_LOG"
   grep -qx 'vps_psiphon_gemini_result 1' "$ROOT/metrics/vps-psiphon.prom"
+}
+
+@test "watchdog: a rotation starts the client on an empty config directory, region from the env" {
+  mkdir -p "$ROOT/config/ca.psiphon.PsiphonTunnel.tunnel-core/datastore"
+  echo servers > "$ROOT/config/ca.psiphon.PsiphonTunnel.tunnel-core/datastore/psiphon.boltdb"
+  psiphon_template > "$ROOT/config/psiphon.config"
+  FAKE_GEM_OUT="$GEM_REFUSED_NEW" run_watchdog
+  rotated_fresh
+  # stop, then empty, then start: never emptied under a running client.
+  [ "$(grep -n 'systemctl stop' "$STUB_LOG" | cut -d: -f1)" -lt "$(grep -n 'systemctl start' "$STUB_LOG" | cut -d: -f1)" ]
+  [ -z "$(ls -A "$ROOT/config")" ]
+  grep -qx 'EGRESS_REGION=NL' "$ROOT/etc/default/vps-psiphon"
+}
+
+@test "cli: fresh start — a CONF_DIR it would not empty is left alone, and the tunnel still restarts" {
+  eval "$(installer_fn fresh_start)"
+  mkdir -p "$ROOT/keep"; echo x > "$ROOT/keep/f"
+  CONF_DIR=/ run fresh_start
+  [ "$status" -eq 1 ] && [[ "$output" == *"not a directory this would empty"* ]]
+  grep -qx 'systemctl restart vps-psiphon.service' "$STUB_LOG"
+  refute grep -q 'systemctl stop' "$STUB_LOG"
+  [ -e "$ROOT/keep/f" ]
+}
+
+@test "cli: advance-region edits the env file alone" {
+  psiphon_template > "$ROOT/config/psiphon.config"
+  run bash "$ROOT/usr/local/sbin/vps-psiphon-advance-region"
+  [ "$output" = "DE -> NL" ]
+  grep -qx 'EGRESS_REGION=NL' "$ROOT/etc/default/vps-psiphon"
+  diff <(psiphon_template) "$ROOT/config/psiphon.config"
+}
+
+@test "cli: rotate and region start the client on an empty config directory" {
+  echo servers > "$ROOT/config/psiphon.config"
+  run_cli rotate
+  rotated_fresh
+  [ ! -e "$ROOT/config/psiphon.config" ]
+  : > "$STUB_LOG"; echo servers > "$ROOT/config/psiphon.config"
+  run_cli region NL
+  rotated_fresh
+  [ ! -e "$ROOT/config/psiphon.config" ]
+  grep -qx 'EGRESS_REGION=NL' "$ROOT/etc/default/vps-psiphon"
 }
 
 @test "watchdog: a decisive failure still waits for the cooldown, and logs that it waits" {
   printf 'last_rotate=%s\ntunnel=%s\n' "$(( $(date +%s) - 600 ))" "$FAKE_STARTED" > "$ROOT/var/lib/vps-psiphon-watchdog.state"
   FAKE_GEM_OUT="$GEM_REFUSED_NEW" run_watchdog
-  refute grep -q 'systemctl restart' "$STUB_LOG"
+  refute rotated
   wd_log | grep -qE 'rotation due but held: 1[12][0-9]{2}s of the 1800s cooldown left'
 }
 
@@ -634,7 +685,7 @@ GEM_ERROR_REPLY='[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],{\"11\":[\"Technical E
   fake_impersonate
   FAKE_GEM_CODE=302 FAKE_GEM_HEAD=$'location: https://www.google.com/sorry/index\r\n' run_watchdog
   wd_log | grep -q 'check failed (google-captcha'
-  grep -q 'systemctl restart vps-psiphon.service' "$STUB_LOG"
+  rotated_fresh
 }
 
 @test "watchdog: a new tunnel starts with an empty window" {
@@ -643,10 +694,10 @@ GEM_ERROR_REPLY='[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],{\"11\":[\"Technical E
   FAKE_YT_W="200000 200" run_watchdog
   wd_log | grep -q 'new tunnel (started '
   wd_log | grep -q 'slow-tunnel .*1 of the last 1 checks'
-  refute grep -q 'systemctl restart' "$STUB_LOG"
+  refute rotated
   # Same tunnel on the next check: the window carries on and the second slow one rotates.
   FAKE_YT_W="200000 200" run_watchdog
-  grep -q 'systemctl restart vps-psiphon.service' "$STUB_LOG"
+  rotated_fresh
 }
 
 @test "watchdog: a check during which the tunnel restarted is not judged" {
@@ -655,7 +706,7 @@ GEM_ERROR_REPLY='[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],{\"11\":[\"Technical E
   FAKE_STARTED_SEQ="$seq_f" FAKE_GEM_OUT="$GEM_REFUSED_NEW" run_watchdog
   [ "$status" -eq 0 ]
   wd_log | grep -q 'check not judged: the tunnel restarted during it (it read: gemini-refused'
-  refute grep -q 'systemctl restart' "$STUB_LOG"
+  refute rotated
   # Nothing counted: the window is as it was (empty).
   grep -qE "^window=(''|)$" "$ROOT/var/lib/vps-psiphon-watchdog.state"
 }
@@ -663,14 +714,14 @@ GEM_ERROR_REPLY='[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],{\"11\":[\"Technical E
 @test "watchdog: rotations that keep not helping back off, and a passing check ends it" {
   printf 'futile=2\nlast_rotate=0\ntunnel=%s\n' "$FAKE_STARTED" > "$ROOT/var/lib/vps-psiphon-watchdog.state"
   FAKE_GEM_OUT="$GEM_REFUSED_NEW" run_watchdog
-  grep -q 'systemctl restart vps-psiphon.service' "$STUB_LOG"
+  rotated_fresh
   [ "$(grep -c '^TG .*3 rotations in a row have not brought a passing check' "$STUB_LOG")" -eq 1 ]
   grep -qx 'vps_psiphon_rotation_cooldown_seconds 3600' "$ROOT/metrics/vps-psiphon.prom"
   # 40 minutes on: past the base cooldown, short of the backed-off one.
   sed -i "s/^last_rotate=.*/last_rotate=$(( $(date +%s) - 2400 ))/" "$ROOT/var/lib/vps-psiphon-watchdog.state"
   : > "$STUB_LOG"
   FAKE_GEM_OUT="$GEM_REFUSED_NEW" run_watchdog
-  refute grep -q 'systemctl restart' "$STUB_LOG"
+  refute rotated
   wd_log | grep -q 'of the 3600s cooldown left (backed off after 3 rotations'
   run_watchdog
   wd_log | grep -q 'a check passes again after 3 rotations: the back-off is over'
@@ -716,7 +767,7 @@ EOF
   [ "$status" -eq 0 ]
   [[ "$output" != *"value too great"* && "$output" != *"integer expression"* && "$output" != *"command not found"* ]]
   # last_rotate=08 is 8: long ago, so the decisive refusal rotates.
-  grep -q 'systemctl restart vps-psiphon.service' "$STUB_LOG"
+  rotated_fresh
   run_watchdog
   [ "$status" -eq 0 ] && [[ "$output" != *"command not found"* ]]
   [ ! -e "$ROOT/PWN" ]
@@ -733,7 +784,7 @@ EOF
 @test "watchdog: FAIL_THRESHOLD=0 does not rotate a healthy tunnel" {
   sed -i 's/^FAIL_THRESHOLD=.*/FAIL_THRESHOLD=0/' "$ROOT/etc/default/vps-psiphon"
   run_watchdog
-  refute grep -q 'systemctl restart' "$STUB_LOG"
+  refute rotated
 }
 
 @test "watchdog: a build without a Chrome wrapper counts as missing" {
@@ -808,7 +859,7 @@ launcher_mode() { awk '{print $2}' "$ROOT/var/lib/vps-psiphon-run.state"; }
   grep -q '"EgressRegion": ""' "$ROOT/config/psiphon.config"
 }
 
-@test "launcher: --inproxy takes its line out and leaves the image's config as it was" {
+@test "launcher: --inproxy takes its line out and leaves the image's config as it was, regions aside" {
   psiphon_template > "$ROOT/config/psiphon.config"
   c="$ROOT/config/psiphon.config"
   run_launcher
@@ -816,7 +867,29 @@ launcher_mode() { awk '{print $2}' "$ROOT/var/lib/vps-psiphon-run.state"; }
   echo EXCLUDE_INPROXY=0 >> "$ROOT/etc/default/vps-psiphon"
   run_launcher
   [ "$(launcher_mode)" = psiphon-default ]
-  diff <(psiphon_template) "$c"
+  diff <(psiphon_template | sed -e 's/"IN"/"DE"/' -e 's/"SG"/"DE"/') "$c"
+}
+
+@test "launcher: the regions come from the env file at every start; auto is written empty" {
+  c="$ROOT/config/psiphon.config"
+  # Seeded by an older version, which left the template's SG for auto.
+  psiphon_template > "$c"
+  sed -i 's/^EGRESS_REGION=.*/EGRESS_REGION=/' "$ROOT/etc/default/vps-psiphon"
+  run_launcher
+  [ "$status" -eq 0 ]
+  grep -q '"EgressRegion": ""' "$c"
+  grep -q '"DeviceRegion": "DE"' "$c"
+  # A changed region applies at the next start, with nothing else to clear.
+  sed -i 's/^EGRESS_REGION=.*/EGRESS_REGION=NL/' "$ROOT/etc/default/vps-psiphon"
+  run_launcher
+  grep -q '"EgressRegion": "NL"' "$c"
+  # A hand edit in another form is not spliced into the file, and the tunnel still starts.
+  sed -i 's#^EGRESS_REGION=.*#EGRESS_REGION="x/y"#' "$ROOT/etc/default/vps-psiphon"
+  run_launcher
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"not a two-letter code"* ]]
+  grep -q '"EgressRegion": "NL"' "$c"
+  [ "$(launcher_mode)" = no-inproxy ]
 }
 
 @test "launcher: a protocol list in its own (or upstream's) form is removed, a hand-written one is not" {

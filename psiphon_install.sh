@@ -147,11 +147,32 @@ img_canon()  {
   if [ -n "$d" ]; then printf '%s@%s' "$(img_repo "$1")" "$d"; else printf '%s' "$1"; fi
 }
 
-# The generated launcher and CLI need these too. They get these exact definitions,
+# The tunnel restarted on an empty config directory, which the launcher seeds again from
+# the env file. The client keeps the servers it knows in that directory, and a plain
+# restart kept bringing it back to the same server in the country: rotations through a
+# pool of four countries kept landing on the same four exits — in one journal, 13
+# rotations into one country over two days all came back to one server — and a pool with
+# no good exit among them never left it (measured by vps-psiphon 1.3, whose fix this is).
+# Every rotation (the watchdog's, `rotate`) and `region` start this way. A CONF_DIR of
+# fewer than two path components is refused: the env file is edited by hand, and this
+# empties the directory it names.
+fresh_start() {
+  local c="${CONF_DIR:-/opt/vps-psiphon/config}"
+  case "$c" in
+    /*/*) : ;;
+    *) echo "CONF_DIR='$c' is not a directory this would empty — restarting without a fresh start" >&2
+       systemctl restart vps-psiphon.service; return 1 ;;
+  esac
+  systemctl stop vps-psiphon.service
+  rm -rf "${c:?}"/*; mkdir -p "$c"; chown -R 1000:1000 "$c"
+  systemctl start vps-psiphon.service
+}
+
+# The generated launcher, watchdog and CLI need these too. They get these exact definitions,
 # written in where @@SHARED_FUNCS@@ stands, rather than a hand-kept second copy that
 # could drift: the reinstall path and update-image must parse IMAGE the same way.
 # Through ENVIRON, not awk -v, which would expand the \n inside cc_list.
-SHARED_FUNCS="$(declare -f cc_list img_repo img_tag img_tagged img_digest img_canon)"
+SHARED_FUNCS="$(declare -f cc_list img_repo img_tag img_tagged img_digest img_canon fresh_start)"
 put_shared_funcs() {
   local f="$1" t; t="$(mktemp "$f.XXXXXX")"
   SHARED_FUNCS="$SHARED_FUNCS" awk '$0 == "@@SHARED_FUNCS@@" { print ENVIRON["SHARED_FUNCS"]; next } { print }' \
@@ -1058,11 +1079,10 @@ cfg="${CONF_DIR}/psiphon.config"
 # called with || errexit is off, so each command carries its own || return 1.
 
 # The image writes psiphon.config only when it is absent, from its template plus the
-# ports and regions, and then never again. Seeded here the same way, so the first
-# tunnel after an install or `region` already carries the setting below. If the
-# template cannot be read, the image seeds the file as before and the setting applies
-# from the next start. EgressRegion is written even when empty: the template says SG,
-# and the image replaces it only when a region is set, so "auto" used to mean Singapore.
+# ports and regions, and then never again. Seeded here from the same template, so the
+# first tunnel after an install, a rotation or `region` already carries the settings
+# below; the regions are written there, at every start. If the template cannot be read,
+# the image seeds the file as before and the settings apply from the next start.
 seed_config() {
   rm -rf "$cfg.new" 2>/dev/null
   docker run --rm --entrypoint cat "$IMG" /etc/psiphon/psiphon.config > "$cfg.new" 2>/dev/null || return 1
@@ -1072,11 +1092,7 @@ seed_config() {
   sed -i -E \
     -e "s/\"LocalHttpProxyPort\"[[:space:]]*:[[:space:]]*[0-9]+/\"LocalHttpProxyPort\": ${HTTP_PORT}/" \
     -e "s/\"LocalSocksProxyPort\"[[:space:]]*:[[:space:]]*[0-9]+/\"LocalSocksProxyPort\": ${SOCKS_PORT}/" \
-    -e "s/\"EgressRegion\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"EgressRegion\": \"${EGRESS_REGION:-}\"/" \
     "$cfg.new" || return 1
-  if [ -n "${DEVICE_REGION:-}" ]; then
-    sed -i -E "s/\"DeviceRegion\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"DeviceRegion\": \"${DEVICE_REGION}\"/" "$cfg.new" || return 1
-  fi
   if command -v jq >/dev/null 2>&1; then jq -e . "$cfg.new" >/dev/null 2>&1 || return 1; fi
   chown 1000:1000 "$cfg.new" 2>/dev/null || true
   mv "$cfg.new" "$cfg" || return 1
@@ -1118,9 +1134,26 @@ rm -rf "$cfg.new" 2>/dev/null || true
 # any other form is left alone.
 mode=psiphon-default
 [ "${EXCLUDE_INPROXY:-1}" = 1 ] && mode=no-inproxy
+# The regions come from the env file at every start, an empty one written as empty, which
+# Psiphon reads as any country. The image's template says "SG" and "IN" and the image
+# replaces them only with a value that is not empty, so "auto" used to exit through
+# Singapore — and a config seeded by an older version still says so until this rewrites
+# it. Only a value in the form the installer writes (two capital letters, or nothing) is
+# written; a hand edit in any other form leaves the file's value as it is, and says so.
+regions_ok=1
+for r in "${EGRESS_REGION:-}" "${DEVICE_REGION:-}"; do
+  [[ "$r" =~ ^([A-Z]{2})?$ ]] || regions_ok=0
+done
+[ "$regions_ok" = 1 ] || log "EGRESS_REGION or DEVICE_REGION in /etc/default/vps-psiphon is not a two-letter code — psiphon.config keeps its regions"
 edit_config() {
   rm -rf "$cfg.edit" 2>/dev/null
   cp "$cfg" "$cfg.edit" || return 1
+  if [ "$regions_ok" = 1 ]; then
+    sed -i -E \
+      -e "s/\"EgressRegion\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"EgressRegion\": \"${EGRESS_REGION:-}\"/" \
+      -e "s/\"DeviceRegion\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"DeviceRegion\": \"${DEVICE_REGION:-}\"/" \
+      "$cfg.edit" || return 1
+  fi
   sed -i -E -e '/^ "DisableTactics": (true|false),$/d' \
             -e '/^ "LimitTunnelProtocols": \[[^]]*\],$/d' "$cfg.edit" || return 1
   if [ "$mode" = no-inproxy ]; then
@@ -1178,16 +1211,16 @@ chmod 755 /usr/local/sbin/vps-psiphon-run
 # ---- region pool ------------------------------------------------------------
 cat > /usr/local/sbin/vps-psiphon-advance-region <<'ADV'
 #!/usr/bin/env bash
-# Advance EGRESS_REGION to the next country in REGION_POOL and apply it. Prints
-# "old -> new" when it changes anything, silent when there is no pool.
+# Advance EGRESS_REGION to the next country in REGION_POOL. Prints "old -> new" when it
+# changes anything, silent when there is no pool.
 #
 # Rotating within one country retries exactly the servers that are exhausted when it
 # is busy; walking a pool draws on another country instead, without handing the choice
 # to "auto", which may answer from another continent.
 #
-# Applied by rewriting psiphon.config in place — the image seeds that file only when
-# absent, so the edit sticks. Deliberately gentler than the `region` subcommand, which
-# wipes the config directory and the client's cached server list with it.
+# Only the env file is edited. Both callers, the watchdog and `vps-psiphon rotate`, then
+# start the client on an empty config directory, and the launcher writes the region
+# from the env file into psiphon.config at every start.
 set -uo pipefail
 ENVF=/etc/default/vps-psiphon
 # shellcheck source=/dev/null
@@ -1206,8 +1239,6 @@ done
 [ "$nxt" = "$cur" ] && exit 0
 
 sed -i "s/^EGRESS_REGION=.*/EGRESS_REGION=$nxt/" "$ENVF"
-cfg="${CONF_DIR:-/opt/vps-psiphon/config}/psiphon.config"
-[ -f "$cfg" ] && sed -i -E "s/\"EgressRegion\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"EgressRegion\": \"$nxt\"/" "$cfg"
 printf '%s -> %s\n' "${cur:-auto}" "$nxt"
 ADV
 chmod 0755 /usr/local/sbin/vps-psiphon-advance-region
@@ -1340,6 +1371,13 @@ esac
 if grep -q '"wrb.fr",null,"\[' "$d/out" 2>/dev/null; then
   echo "inconclusive (an answer without a reply${errs:+, error ${errs% }})$note"; exit 2
 fi
+# A message Google sends to its captcha gets a 302 page in place of an answer. Told apart
+# from silence in the log, but never a rotation: the message goes by plain curl, and a
+# captcha for curl's handshake says nothing about what a browser gets on this exit —
+# rotating on the browser's captcha is IMPERSONATE's job, above. (vps-psiphon 1.3.)
+if grep -qiE 'https://([a-z0-9-]+\.)*google\.[a-z]{2,3}(\.[a-z]{2})?/sorry/' "$d/out" 2>/dev/null; then
+  echo "inconclusive (the message was sent to /sorry${errs:+, error ${errs% }})$note"; exit 2
+fi
 echo "inconclusive (no reply${errs:+, error ${errs% }})$note"; exit 2
 GEM
 chmod 755 /usr/local/sbin/vps-psiphon-gemini-check
@@ -1396,6 +1434,7 @@ cat > /usr/local/sbin/vps-psiphon-watchdog <<'WD'
 # on Google's side looks exactly like a healthy exit.
 set -uo pipefail
 . /etc/default/vps-psiphon
+@@SHARED_FUNCS@@
 LOG=/var/log/vps-psiphon-watchdog.log
 STATE=/var/lib/vps-psiphon-watchdog.state
 S=(--socks5-hostname "${BIND:-127.0.0.1}:${SOCKS_PORT}")
@@ -1784,7 +1823,9 @@ if [ "$due" = 1 ] && [ $((now - last_rotate)) -ge "$wait_s" ]; then
   log "rotating away from exit $old"
   moved="$(/usr/local/sbin/vps-psiphon-advance-region 2>/dev/null)"
   [ -n "$moved" ] && log "region $moved"
-  systemctl restart vps-psiphon.service
+  # On an empty config directory, or the client draws the same server again (see
+  # fresh_start in the installer).
+  fresh_start 2>>"$LOG"
   sleep 45
   new="$(curl -s --max-time 20 "${S[@]}" https://api.ipify.org 2>/dev/null || echo '?')"
   log "rotated: $old -> $new"
@@ -1869,6 +1910,7 @@ if [ -n "${METRICS_DIR:-}" ] && [ -d "$METRICS_DIR" ]; then
   }
 fi
 WD
+put_shared_funcs /usr/local/sbin/vps-psiphon-watchdog
 chmod 755 /usr/local/sbin/vps-psiphon-watchdog
 touch /var/log/vps-psiphon-watchdog.log
 # The watchdog appends a few lines every ten minutes, forever. copytruncate because it
@@ -2060,7 +2102,7 @@ case "${1:-status}" in
     echo "rotating (fresh tunnel, new exit)…"
     moved="$(/usr/local/sbin/vps-psiphon-advance-region 2>/dev/null)"
     [ -n "$moved" ] && echo "region    : $moved"
-    systemctl restart vps-psiphon.service; sleep 45
+    fresh_start; sleep 45
     # advance-region rewrote the env file; without re-reading it, status would judge
     # the new exit against the region we just left.
     [ -r /etc/default/vps-psiphon ] && . /etc/default/vps-psiphon
@@ -2116,10 +2158,8 @@ case "${1:-status}" in
     take_lock
     sed -i "s/^EGRESS_REGION=.*/EGRESS_REGION=$r/" /etc/default/vps-psiphon
     EGRESS_REGION="$r"   # the file was sourced at startup; keep status() honest
-    # The image seeds /config on first run only; an existing psiphon.config keeps the
-    # OLD region silently, so wipe it or the change is a no-op.
-    rm -rf "${CONF_DIR:?}"/*; mkdir -p "$CONF_DIR"; chown -R 1000:1000 "$CONF_DIR"
-    systemctl restart vps-psiphon.service; sleep 45; status ;;
+    # A new country is a new draw of servers, as every rotation is.
+    fresh_start; sleep 45; status ;;
   speed)
     U="https://speed.cloudflare.com/__down?bytes=50000000"
     echo -n "single 50MB : "
