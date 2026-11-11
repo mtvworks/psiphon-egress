@@ -1,0 +1,7 @@
+version: 2
+updates:
+  # Keeps the SHA-pinned actions current: each update arrives as a PR that CI checks.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
