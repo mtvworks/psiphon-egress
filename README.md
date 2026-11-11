@@ -182,6 +182,12 @@ removed). The watchdog logs every tunnel the client brings up with its
 protocol — `tunnel up: QUIC-OSSH (dialled at …)` — which is where the exclusion
 shows. `--inproxy` lets Psiphon choose again.
 
+The launcher also raises Psiphon's window per connection from 128 KB to 1 MB
+(`"SSHChannelWindowSize": 32`): the default caps one connection at about
+20 Mbit/s over a 30 ms tunnel, however idle it is, and 1 MB measured 5–14×
+faster per connection in vps-psiphon's tests with no added wait for a small
+request behind eight downloads.
+
 Nothing the launcher edits can keep the tunnel from starting: every step is
 checked, and a config it cannot read in the shape it knows is left as the image
 wrote it — `status` then says in-proxy is not excluded, and one alert goes out.

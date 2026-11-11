@@ -158,11 +158,12 @@ img_canon()  {
 # empties the directory it names.
 fresh_start() {
   local c="${CONF_DIR:-/opt/vps-psiphon/config}"
-  case "$c" in
-    /*/*) : ;;
-    *) echo "CONF_DIR='$c' is not a directory this would empty — restarting without a fresh start" >&2
-       systemctl restart vps-psiphon.service; return 1 ;;
-  esac
+  # Two or more plain components, no trailing slash, no "." or ".." among them: /opt/,
+  # //, /opt/.. and the like are refused rather than emptied.
+  if ! [[ "$c" =~ ^(/[A-Za-z0-9_][A-Za-z0-9._-]*){2,}$ ]] || [[ "$c" =~ /\.\.?(/|$) ]]; then
+    echo "CONF_DIR='$c' is not a directory this would empty — restarting without a fresh start" >&2
+    systemctl restart vps-psiphon.service; return 1
+  fi
   systemctl stop vps-psiphon.service
   rm -rf "${c:?}"/*; mkdir -p "$c"; chown -R 1000:1000 "$c"
   systemctl start vps-psiphon.service
@@ -831,13 +832,14 @@ fi
 
 # ------------------------------------------------------------------ install --
 mkdir -p "$CONF_DIR"
-# The image seeds /config once and then ignores EGRESS_REGION, so a stale config
-# would silently keep the old country across a --region change.
-OLD_REGION="__none__"
+# A changed region is a new draw of servers, as `region` is: the restart at the end is
+# then a fresh start (fresh_start), which stops the client before emptying CONF_DIR —
+# never under a running one. The region itself the launcher writes at every start.
+OLD_REGION="__none__"; REGION_CHANGED=0
 [ -r "$ENVF" ] && OLD_REGION="$(sed -n 's/^EGRESS_REGION=//p' "$ENVF")"
 if [ "$OLD_REGION" != "__none__" ] && [ "$OLD_REGION" != "$EGRESS_REGION" ]; then
-  say "egress region ${OLD_REGION:-auto} -> ${EGRESS_REGION:-auto}: clearing cached config"
-  rm -rf "${CONF_DIR:?}"/*
+  say "egress region ${OLD_REGION:-auto} -> ${EGRESS_REGION:-auto}: the tunnel starts on a fresh server list"
+  REGION_CHANGED=1
 fi
 chown -R 1000:1000 "$CONF_DIR"
 
@@ -1140,20 +1142,31 @@ mode=psiphon-default
 # Singapore — and a config seeded by an older version still says so until this rewrites
 # it. Only a value in the form the installer writes (two capital letters, or nothing) is
 # written; a hand edit in any other form leaves the file's value as it is, and says so.
-regions_ok=1
-for r in "${EGRESS_REGION:-}" "${DEVICE_REGION:-}"; do
-  [[ "$r" =~ ^([A-Z]{2})?$ ]] || regions_ok=0
+for v in EGRESS_REGION DEVICE_REGION; do
+  if ! [[ "${!v:-}" =~ ^([A-Z]{2})?$ ]]; then
+    # Written as any country rather than left to the template's SG and IN, which every
+    # fresh start would bring back.
+    log "$v='${!v}' in /etc/default/vps-psiphon is not a two-letter code — written as empty (any country)"
+    printf -v "$v" ''
+  fi
 done
-[ "$regions_ok" = 1 ] || log "EGRESS_REGION or DEVICE_REGION in /etc/default/vps-psiphon is not a two-letter code — psiphon.config keeps its regions"
+#
+# Psiphon's window per connection, in 32 KB blocks. Its default, 4 (128 KB), caps one
+# connection at about a window per round trip — ~20 Mbit/s over a 30 ms tunnel, however
+# idle the tunnel is. 32 (1 MB) measured 5-14x faster per connection with no added wait
+# for a small request behind eight downloads; 64 and 128 began to delay it (measured by
+# vps-psiphon, whose setting this is). An owned line, as DisableTactics is below.
+WINDOW=32
 edit_config() {
   rm -rf "$cfg.edit" 2>/dev/null
   cp "$cfg" "$cfg.edit" || return 1
-  if [ "$regions_ok" = 1 ]; then
-    sed -i -E \
-      -e "s/\"EgressRegion\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"EgressRegion\": \"${EGRESS_REGION:-}\"/" \
-      -e "s/\"DeviceRegion\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"DeviceRegion\": \"${DEVICE_REGION:-}\"/" \
-      "$cfg.edit" || return 1
-  fi
+  sed -i -E \
+    -e "s/\"EgressRegion\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"EgressRegion\": \"${EGRESS_REGION:-}\"/" \
+    -e "s/\"DeviceRegion\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"DeviceRegion\": \"${DEVICE_REGION:-}\"/" \
+    -e '/^ "SSHChannelWindowSize": [0-9]+,$/d' \
+    "$cfg.edit" || return 1
+  sed -i "0,/{/s/{/{\n \"SSHChannelWindowSize\": $WINDOW,/" "$cfg.edit" || return 1
+  [ "$(grep -c "^ \"SSHChannelWindowSize\": $WINDOW,\$" "$cfg.edit")" = 1 ] || return 1
   sed -i -E -e '/^ "DisableTactics": (true|false),$/d' \
             -e '/^ "LimitTunnelProtocols": \[[^]]*\],$/d' "$cfg.edit" || return 1
   if [ "$mode" = no-inproxy ]; then
@@ -1229,6 +1242,9 @@ ENVF=/etc/default/vps-psiphon
 
 cur="${EGRESS_REGION:-}"; first=""; nxt=""; take=0
 for r in $REGION_POOL; do
+  # The pool is edited by hand too; a value the installer would not write is skipped,
+  # not copied into EGRESS_REGION, where the launcher would refuse it at every start.
+  [[ "$r" =~ ^[A-Z]{2}$ ]] || continue
   [ -z "$first" ] && first="$r"
   if [ "$take" = 1 ]; then nxt="$r"; break; fi
   [ "$r" = "$cur" ] && take=1
@@ -1236,6 +1252,7 @@ done
 # Not in the pool (hand-edited, or the pool changed under us) falls to the first
 # entry, which is also what makes the last entry wrap around.
 [ -n "$nxt" ] || nxt="$first"
+[ -n "$nxt" ] || exit 0   # no usable country in the pool at all
 [ "$nxt" = "$cur" ] && exit 0
 
 sed -i "s/^EGRESS_REGION=.*/EGRESS_REGION=$nxt/" "$ENVF"
@@ -1561,6 +1578,12 @@ if [ -n "$run_mode" ] && [ "$run_mode" != "$run_mode_seen" ]; then
   if [ "$run_mode" = unedited ]; then
     log "launcher could not edit psiphon.config: in-proxy is not excluded on this tunnel"
     notify "the launcher could not edit psiphon.config (not in the shape it knows), so in-proxy is NOT kept out of this tunnel. See journalctl -u vps-psiphon and $CONF_DIR/psiphon.config"
+  elif [ "$run_mode" = pending ]; then
+    # The image seeded the config itself, so this tunnel runs on its template: in-proxy
+    # not kept out, auto as SG. Every rotation starts on an empty directory, so until
+    # the template can be read again (a changed image, say) no start ever catches up.
+    log "launcher could not seed psiphon.config from the image: in-proxy is not excluded on this tunnel"
+    notify "the launcher could not seed psiphon.config from the image's template, so this tunnel runs on the image's own config: in-proxy is NOT kept out, and auto exits through the template's SG. Every rotation repeats this. See journalctl -u vps-psiphon"
   fi
   run_mode_seen="$run_mode"
 fi
@@ -2085,7 +2108,7 @@ status() {
   v="$(awk '{print $2}' /var/lib/vps-psiphon-run.state 2>/dev/null)"
   case "$v" in
     no-inproxy)      echo "protocols : in-proxy excluded (tactics off)" ;;
-    pending)         echo "protocols : in-proxy exclusion applies from the next start (the image seeded the config on this one)" ;;
+    pending)         echo "protocols : in-proxy NOT excluded on this tunnel — the launcher could not seed psiphon.config from the image (journalctl -u vps-psiphon); every fresh start repeats it" ;;
     unedited)        echo "protocols : in-proxy NOT excluded — psiphon.config is not in the shape the launcher edits (journalctl -u vps-psiphon)" ;;
     overridden)      echo "protocols : in-proxy NOT excluded — psiphon.config sets \"DisableTactics\": false by hand" ;;
     psiphon-default) echo "protocols : Psiphon's own choice (--inproxy)" ;;
@@ -2472,7 +2495,11 @@ systemctl daemon-reload
 systemctl enable vps-psiphon.service >/dev/null 2>&1
 # restart, not "enable --now": on a reinstall the service is already active and
 # would keep running with the previous parameters.
-systemctl restart vps-psiphon.service
+if [ "$REGION_CHANGED" = 1 ]; then
+  fresh_start || true   # on a CONF_DIR it would not empty it restarts, and says why
+else
+  systemctl restart vps-psiphon.service
+fi
 [ "$WATCHDOG" = 1 ] && systemctl enable --now vps-psiphon-watchdog.timer
 
 # ------------------------------------------------------------------- verify --

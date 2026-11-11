@@ -436,7 +436,7 @@ put_shared_funcs '$f'"
 @test "installer takes the lock before it reads or writes the old settings" {
   lock="$(grep -nE '^flock -w [0-9]+ 9 ' "$INSTALLER" | cut -d: -f1)"
   first_read="$(grep -n '"\$ENVF"' "$INSTALLER" | head -1 | cut -d: -f1)"
-  restart="$(grep -n '^systemctl restart vps-psiphon.service' "$INSTALLER" | cut -d: -f1)"
+  restart="$(grep -nE '^  (systemctl restart vps-psiphon.service|fresh_start)' "$INSTALLER" | head -1 | cut -d: -f1)"
   [ -n "$lock" ] && [ -n "$first_read" ] && [ -n "$restart" ]
   [ "$lock" -lt "$first_read" ]
   [ "$lock" -lt "$restart" ]
@@ -618,12 +618,26 @@ GEM_ERROR_REPLY='[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],{\"11\":[\"Technical E
 
 @test "cli: fresh start — a CONF_DIR it would not empty is left alone, and the tunnel still restarts" {
   eval "$(installer_fn fresh_start)"
-  mkdir -p "$ROOT/keep"; echo x > "$ROOT/keep/f"
-  CONF_DIR=/ run fresh_start
-  [ "$status" -eq 1 ] && [[ "$output" == *"not a directory this would empty"* ]]
-  grep -qx 'systemctl restart vps-psiphon.service' "$STUB_LOG"
-  refute grep -q 'systemctl stop' "$STUB_LOG"
-  [ -e "$ROOT/keep/f" ]
+  for d in / /opt /opt/ // /opt/.. /opt/./x '/opt/a b' "$ROOT/config/"; do
+    : > "$STUB_LOG"
+    CONF_DIR="$d" run fresh_start
+    [ "$status" -eq 1 ] && [[ "$output" == *"not a directory this would empty"* ]]
+    grep -qx 'systemctl restart vps-psiphon.service' "$STUB_LOG"
+    refute grep -q 'systemctl stop' "$STUB_LOG"
+  done
+  echo x > "$ROOT/config/f"
+  CONF_DIR="$ROOT/config" run fresh_start
+  [ "$status" -eq 0 ] && [ ! -e "$ROOT/config/f" ]
+}
+
+@test "cli: advance-region skips a pool value the installer would not write" {
+  sed -i "s/^REGION_POOL=.*/REGION_POOL='de x;y NL'/" "$ROOT/etc/default/vps-psiphon"
+  run bash "$ROOT/usr/local/sbin/vps-psiphon-advance-region"
+  [ "$output" = "DE -> NL" ]
+  sed -i "s/^REGION_POOL=.*/REGION_POOL='de fr'/" "$ROOT/etc/default/vps-psiphon"
+  run bash "$ROOT/usr/local/sbin/vps-psiphon-advance-region"
+  [ -z "$output" ]
+  grep -qx 'EGRESS_REGION=NL' "$ROOT/etc/default/vps-psiphon"
 }
 
 @test "cli: advance-region edits the env file alone" {
@@ -812,6 +826,15 @@ EOF
   grep -qx 'vps_psiphon_inproxy_excluded 1' "$ROOT/metrics/vps-psiphon.prom"
 }
 
+@test "watchdog: a config the launcher could not seed is alerted once, however many starts repeat it" {
+  echo "$(date +%s) pending" > "$ROOT/var/lib/vps-psiphon-run.state"
+  run_watchdog; run_watchdog
+  [ "$(grep -c "^TG .*could not seed psiphon.config" "$STUB_LOG")" -eq 1 ]
+  grep -qx 'vps_psiphon_inproxy_excluded 0' "$ROOT/metrics/vps-psiphon.prom"
+  run_cli status
+  [[ "$output" == *"in-proxy NOT excluded on this tunnel"* ]]
+}
+
 @test "watchdog: a check not judged still keeps its once-only alerts sent" {
   echo "$(date +%s) unedited" > "$ROOT/var/lib/vps-psiphon-run.state"
   seq_f="$ROOT/started.seq"
@@ -867,7 +890,8 @@ launcher_mode() { awk '{print $2}' "$ROOT/var/lib/vps-psiphon-run.state"; }
   echo EXCLUDE_INPROXY=0 >> "$ROOT/etc/default/vps-psiphon"
   run_launcher
   [ "$(launcher_mode)" = psiphon-default ]
-  diff <(psiphon_template | sed -e 's/"IN"/"DE"/' -e 's/"SG"/"DE"/') "$c"
+  diff <(psiphon_template | sed -e 's/"IN"/"DE"/' -e 's/"SG"/"DE"/' -e '1a\
+ "SSHChannelWindowSize": 32,') "$c"
 }
 
 @test "launcher: the regions come from the env file at every start; auto is written empty" {
@@ -883,13 +907,23 @@ launcher_mode() { awk '{print $2}' "$ROOT/var/lib/vps-psiphon-run.state"; }
   sed -i 's/^EGRESS_REGION=.*/EGRESS_REGION=NL/' "$ROOT/etc/default/vps-psiphon"
   run_launcher
   grep -q '"EgressRegion": "NL"' "$c"
-  # A hand edit in another form is not spliced into the file, and the tunnel still starts.
+  # A hand edit in another form is not spliced into the file: written as any country,
+  # not left to the template's SG, and the tunnel still starts.
   sed -i 's#^EGRESS_REGION=.*#EGRESS_REGION="x/y"#' "$ROOT/etc/default/vps-psiphon"
   run_launcher
   [ "$status" -eq 0 ]
-  [[ "$output" == *"not a two-letter code"* ]]
-  grep -q '"EgressRegion": "NL"' "$c"
+  [[ "$output" == *"EGRESS_REGION='x/y'"*"not a two-letter code"* ]]
+  grep -q '"EgressRegion": ""' "$c"
   [ "$(launcher_mode)" = no-inproxy ]
+}
+
+@test "launcher: the 1 MB window per connection is one owned line, kept at every start" {
+  c="$ROOT/config/psiphon.config"
+  psiphon_template > "$c"
+  run_launcher; run_launcher
+  [ "$(grep -c '"SSHChannelWindowSize"' "$c")" -eq 1 ]
+  grep -qx ' "SSHChannelWindowSize": 32,' "$c"
+  jq -e '.SSHChannelWindowSize == 32' "$c" >/dev/null
 }
 
 @test "launcher: a protocol list in its own (or upstream's) form is removed, a hand-written one is not" {

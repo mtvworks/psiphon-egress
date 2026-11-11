@@ -40,7 +40,15 @@ the author's measurements quoted in the comments where they justify a choice:
 - from 1.3: **every rotation starts the client on an empty config directory**, so it
   draws a server afresh instead of returning to the one it knows; **the regions are
   written from the env file at every start**, so auto is no longer the template's
-  Singapore; and a message Google sends to `/sorry` is logged apart from silence.
+  Singapore; and a message Google sends to `/sorry` is logged apart from silence;
+- the **1 MB window per connection** (`SSHChannelWindowSize` 32, upstream 2026-09-26),
+  which the first port missed.
+
+Not ported: upstream's `--tunnel-pool N` (several tunnels in one instance, opt-in).
+This watchdog judges one tunnel at a time — failures belong to the tunnel they were
+counted on, a new tunnel starts a clean window, the Gemini check asks about one exit —
+and with a pool every probe rides whichever tunnel takes it, so none of those
+judgements would hold. Our nodes run one tunnel each.
 
 What we changed in them, and why, is in the README ("Asking Gemini itself", "In-proxy
 and Psiphon's tactics", "When rotations do not help"): a reply without a place counts
