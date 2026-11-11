@@ -197,7 +197,8 @@ D
 run_watchdog() { run bash "$ROOT/WD.sh"; WDLOG="$ROOT/var/log/vps-psiphon-watchdog.log"; }
 wd_log() { cat "$ROOT/var/log/vps-psiphon-watchdog.log"; }
 run_cli() { run bash "$ROOT/CLI.sh" "$@"; }
-run_gem() { run bash "$ROOT/usr/local/sbin/vps-psiphon-gemini-check" "$@"; }
+# Shown only when a test fails: what the check answered, and the calls it made.
+run_gem() { run bash "$ROOT/usr/local/sbin/vps-psiphon-gemini-check" "$@"; echo "gem[$status]: $output"; tail -3 "$STUB_LOG"; }
 
 # curl-impersonate as the installer leaves it: the binary and a curl_chromeN wrapper.
 # The wrapper hands over to the curl stub, marked, so a test can tell which one ran.

@@ -505,7 +505,6 @@ GEM_ERROR_REPLY='[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],{\"11\":[\"Technical E
 
 @test "gemini: a message sent to /sorry is told apart from silence, and never a refusal" {
   FAKE_GEM_OUT='<HTML><A HREF="https://www.google.com/sorry/index?continue=x">here</A>' run_gem
-  echo "got: $output"
   [ "$status" -eq 2 ]
   [[ "$output" == "inconclusive (the message was sent to /sorry)" ]]
   # Not Google's own host: only silence.
