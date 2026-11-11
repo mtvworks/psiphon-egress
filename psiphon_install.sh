@@ -99,6 +99,8 @@ ACCEPT_REGIONS=""; ACCEPT_REGIONS_SET=0
 # Optional Telegram alerts from the watchdog (rotation, denied country). Both empty =
 # off. Kept across reinstalls unless given again; '' turns them off.
 TG_TOKEN=""; TG_TOKEN_SET=0; TG_CHAT=""; TG_CHAT_SET=0
+# Optional forum topic (message_thread_id) inside TG_CHAT; empty = the chat itself.
+TG_THREAD=""; TG_THREAD_SET=0
 # The token may come from the environment instead of --tg-token, so it stays out of
 # `ps` and the shell history: VPSPSI_TG_TOKEN=... bash psiphon_install.sh --tg-chat ...
 if [ -n "${VPSPSI_TG_TOKEN+x}" ]; then TG_TOKEN="$VPSPSI_TG_TOKEN"; TG_TOKEN_SET=1; fi
@@ -240,6 +242,8 @@ psiphon_install.sh [options]
   --tg-token TOKEN     Telegram bot token for watchdog alerts (rotations, denied
   --tg-chat ID         country). Both are needed; '' turns alerts off. Kept across
                        reinstalls. Test with: vps-psiphon notify-test
+  --tg-thread ID       optional forum topic (message_thread_id) inside that chat;
+                       default: the chat itself. Kept across reinstalls.
   --metrics-dir DIR    where the watchdog writes vps-psiphon.prom for the
                        node_exporter textfile collector. Default: kept from the
                        last install, else /var/lib/node_exporter/textfile_collector
@@ -278,6 +282,7 @@ while [ $# -gt 0 ]; do
     --image)         IMAGE="${2:?}"; IMAGE_SET=1; shift 2 ;;
     --tg-token)      TG_TOKEN="${2:-}"; TG_TOKEN_SET=1; shift 2 ;;
     --tg-chat)       TG_CHAT="${2:-}";  TG_CHAT_SET=1;  shift 2 ;;
+    --tg-thread)     TG_THREAD="${2:-}"; TG_THREAD_SET=1; shift 2 ;;
     --metrics-dir)   METRICS_DIR="${2:-}"; METRICS_DIR_SET=1; shift 2 ;;
     --memory)        MEM_LIMIT="${2:?}";  MEM_LIMIT_SET=1;  shift 2 ;;
     --pids-limit)    PIDS_LIMIT="${2:?}"; PIDS_LIMIT_SET=1; shift 2 ;;
@@ -331,6 +336,8 @@ check_extras() {
     || die "--tg-token: not a bot token (digits:letters, as BotFather prints it)"
   [ -z "$TG_CHAT" ] || printf '%s\n' "$TG_CHAT" | grep -qxE -e '-?[0-9]+|@[A-Za-z0-9_]+' \
     || die "--tg-chat: expected a numeric chat id or @channelname"
+  [ -z "$TG_THREAD" ] || printf '%s\n' "$TG_THREAD" | grep -qxE '[0-9]+' \
+    || die "--tg-thread: expected a numeric topic id"
   [ -z "$METRICS_DIR" ] || printf '%s\n' "$METRICS_DIR" | grep -qxE '/[A-Za-z0-9._/-]*' \
     || die "--metrics-dir: expected an absolute path"
   # Normalised to single spaces, then each URL held to plain https:// characters: the
@@ -559,6 +566,7 @@ if [ -r "$ENVF" ]; then
   fi
   [ "$TG_TOKEN_SET" = 1 ]    || TG_TOKEN="$(stored TG_TOKEN)"
   [ "$TG_CHAT_SET" = 1 ]     || TG_CHAT="$(stored TG_CHAT)"
+  [ "$TG_THREAD_SET" = 1 ]   || TG_THREAD="$(stored TG_THREAD)"
   # A line present but empty is a decision (metrics off) and survives; no line at all
   # is an install older than the option, which gets the default below.
   if [ "$METRICS_DIR_SET" = 0 ] && grep -q '^METRICS_DIR=' "$ENVF"; then
@@ -998,6 +1006,8 @@ EXCLUDE_INPROXY=$EXCLUDE_INPROXY
 # Test with: vps-psiphon notify-test
 TG_TOKEN='$TG_TOKEN'
 TG_CHAT='$TG_CHAT'
+# Forum topic inside that chat (message_thread_id). Empty = the chat itself.
+TG_THREAD='$TG_THREAD'
 # node_exporter textfile collector directory; the watchdog writes vps-psiphon.prom
 # there after every check. Empty = off.
 METRICS_DIR='$METRICS_DIR'
@@ -1410,6 +1420,7 @@ notify() {
   printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$TG_TOKEN" \
     | curl -s -o /dev/null --max-time 10 -K - \
         --data-urlencode "chat_id=${TG_CHAT}" \
+        ${TG_THREAD:+--data-urlencode "message_thread_id=${TG_THREAD}"} \
         --data-urlencode "text=vps-psiphon @ $(hostname): $*" >/dev/null 2>&1 || true
 }
 
@@ -1947,6 +1958,7 @@ notify() {
   printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$TG_TOKEN" \
     | curl -s -o /dev/null -w '%{http_code}' --max-time 10 -K - \
         --data-urlencode "chat_id=${TG_CHAT}" \
+        ${TG_THREAD:+--data-urlencode "message_thread_id=${TG_THREAD}"} \
         --data-urlencode "text=vps-psiphon @ $(hostname): $*" 2>/dev/null
 }
 

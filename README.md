@@ -279,7 +279,7 @@ A reinstall keeps the pinned digest and the followed tag. `--image repo@sha256:â
 
 Both are off unless configured.
 
-- **Telegram**: `--tg-token <bot token> --tg-chat <chat id>` (or `VPSPSI_TG_TOKEN=<bot token>` in the environment instead of `--tg-token`, which keeps the token out of `ps` and the shell history). The watchdog sends
+- **Telegram**: `--tg-token <bot token> --tg-chat <chat id> [--tg-thread <topic id>]` (or `VPSPSI_TG_TOKEN=<bot token>` in the environment instead of `--tg-token`, which keeps the token out of `ps` and the shell history). The watchdog sends
   an alert on every rotation (reason, old â†’ new exit, region step), the first
   time an exit is seen in a denied country or refused by a target, and when a
   rotation did not bring the tunnel back; once each when rotations start backing
