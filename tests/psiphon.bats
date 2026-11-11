@@ -198,7 +198,7 @@ teardown() { teardown_root; }
 @test "watchdog: recovery is logged once, not on every pass while the failure is in the window" {
   FAKE_YT_W="1000 200" FAKE_YT_RC=28 FAKE_YT_BODY='"GL":"DE"' run_watchdog
   wd_log | grep -q 'check failed (slow-tunnel'
-  for _ in 1 2 3 4 5; do run_watchdog; done
+  run_watchdog; run_watchdog   # the second pass still has the failure in its window
   [ "$(grep -c 'recovered' "$WDLOG")" -eq 1 ]
 }
 
