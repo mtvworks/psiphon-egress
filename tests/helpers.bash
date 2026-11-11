@@ -198,6 +198,7 @@ run_watchdog() { run bash "$ROOT/WD.sh"; WDLOG="$ROOT/var/log/vps-psiphon-watchd
 wd_log() { cat "$ROOT/var/log/vps-psiphon-watchdog.log"; }
 run_cli() { run bash "$ROOT/CLI.sh" "$@"; }
 # Shown only when a test fails: what the check answered, and the calls it made.
+# shellcheck disable=SC2154  # status and output are set by bats run
 run_gem() { run bash "$ROOT/usr/local/sbin/vps-psiphon-gemini-check" "$@"; echo "gem[$status]: $output"; tail -3 "$STUB_LOG"; }
 
 # curl-impersonate as the installer leaves it: the binary and a curl_chromeN wrapper.
