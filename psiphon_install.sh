@@ -1803,7 +1803,9 @@ fi
 # unit: the tunnel that most needs rotating is degraded rather than dead, and it passes
 # every other check — which reset the counter and put rotation out of reach.
 if [ -z "$reason" ]; then
-  [ "$fails" -gt 0 ] && log "recovered (exit $(curl -s --max-time 15 "${S[@]}" https://api.ipify.org 2>/dev/null), country ${gl:-?})"
+  # Recovery is the first pass after a failed check, said once — not every pass while
+  # an older failure still sits in the window.
+  [ "${window: -1}" = 1 ] && log "recovered (exit $(curl -s --max-time 15 "${S[@]}" https://api.ipify.org 2>/dev/null), country ${gl:-?})"
   window="${window}0"
   # A passing check ends a run of rotations that did not help.
   if [ "$futile" -gt 0 ]; then
