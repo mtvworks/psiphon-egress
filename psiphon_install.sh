@@ -1343,7 +1343,11 @@ M='f.req=[null,"[[\"hi\"],null,null]"]'
 ch="$( { curl --help all; curl --help; } 2>/dev/null )"; cv="$(curl -V 2>/dev/null)"
 if [[ "$ch" == *--parallel* ]] && [[ "$cv" == *HTTP2* ]]; then
   i=0
-  while ! grep -q message-done "$d/w" 2>/dev/null && [ "$i" -lt 60 ]; do sleep 2; printf x; i=$((i + 1)); done |
+  # Once curl is done the pipe is closed: the next byte would fail with "write error:
+  # Broken pipe" on stderr, so a failed write ends the trickle, quietly.
+  while ! grep -q message-done "$d/w" 2>/dev/null && [ "$i" -lt 60 ]; do
+    sleep 2; printf x 2>/dev/null || break; i=$((i + 1))
+  done |
     curl --parallel "${C[@]}" "${H[@]}" --max-time 130 -o "$d/out" -w '%{stderr}message-done' \
       --data-urlencode "$M" "$Q" \
       --next "${C[@]}" "${H[@]}" -X POST -T - --max-time 130 -o /dev/null \

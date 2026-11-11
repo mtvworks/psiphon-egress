@@ -503,6 +503,15 @@ GEM_ERROR_REPLY='[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],{\"11\":[\"Technical E
   [ "$status" -eq 1 ]
 }
 
+@test "gemini: the trickle ends quietly once the message is done" {
+  # The keep-alive's input outlives curl; its next byte hits a closed pipe.
+  printf '#!/bin/sh\nexit 0\n' > "$ROOT/bin/sleep"
+  for _ in 1 2 3 4 5; do
+    run_gem
+    refute grep -q 'Broken pipe' <<<"$output"
+  done
+}
+
 @test "gemini: a message sent to /sorry is told apart from silence, and never a refusal" {
   FAKE_GEM_OUT='<HTML><A HREF="https://www.google.com/sorry/index?continue=x">here</A>' run_gem
   [ "$status" -eq 2 ]
