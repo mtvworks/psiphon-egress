@@ -101,6 +101,7 @@ ACCEPT_REGIONS=""; ACCEPT_REGIONS_SET=0
 TG_TOKEN=""; TG_TOKEN_SET=0; TG_CHAT=""; TG_CHAT_SET=0
 # Optional forum topic (message_thread_id) inside TG_CHAT; empty = the chat itself.
 TG_THREAD=""; TG_THREAD_SET=0
+TG_LANG=en; TG_LANG_SET=0
 # The token may come from the environment instead of --tg-token, so it stays out of
 # `ps` and the shell history: VPSPSI_TG_TOKEN=... bash psiphon_install.sh --tg-chat ...
 if [ -n "${VPSPSI_TG_TOKEN+x}" ]; then TG_TOKEN="$VPSPSI_TG_TOKEN"; TG_TOKEN_SET=1; fi
@@ -266,6 +267,7 @@ psiphon_install.sh [options]
                        reinstalls. Test with: vps-psiphon notify-test
   --tg-thread ID       optional forum topic (message_thread_id) inside that chat;
                        default: the chat itself. Kept across reinstalls.
+  --tg-lang en|ru      Telegram alert language (default en; kept across reinstalls).
   --metrics-dir DIR    where the watchdog writes vps-psiphon.prom for the
                        node_exporter textfile collector. Default: kept from the
                        last install, else /var/lib/node_exporter/textfile_collector
@@ -305,6 +307,8 @@ while [ $# -gt 0 ]; do
     --tg-token)      TG_TOKEN="${2:-}"; TG_TOKEN_SET=1; shift 2 ;;
     --tg-chat)       TG_CHAT="${2:-}";  TG_CHAT_SET=1;  shift 2 ;;
     --tg-thread)     TG_THREAD="${2:-}"; TG_THREAD_SET=1; shift 2 ;;
+    --tg-lang)       [ "$#" -ge 2 ] || die "--tg-lang: expected en or ru"
+                     TG_LANG="$2"; TG_LANG_SET=1; shift 2 ;;
     --metrics-dir)   METRICS_DIR="${2:-}"; METRICS_DIR_SET=1; shift 2 ;;
     --memory)        MEM_LIMIT="${2:?}";  MEM_LIMIT_SET=1;  shift 2 ;;
     --pids-limit)    PIDS_LIMIT="${2:?}"; PIDS_LIMIT_SET=1; shift 2 ;;
@@ -360,6 +364,7 @@ check_extras() {
     || die "--tg-chat: expected a numeric chat id or @channelname"
   [ -z "$TG_THREAD" ] || printf '%s\n' "$TG_THREAD" | grep -qxE '[0-9]+' \
     || die "--tg-thread: expected a numeric topic id"
+  case "$TG_LANG" in en|ru) ;; *) die "--tg-lang: expected en or ru" ;; esac
   [ -z "$METRICS_DIR" ] || printf '%s\n' "$METRICS_DIR" | grep -qxE '/[A-Za-z0-9._/-]*' \
     || die "--metrics-dir: expected an absolute path"
   # Normalised to single spaces, then each URL held to plain https:// characters: the
@@ -589,6 +594,9 @@ if [ -r "$ENVF" ]; then
   [ "$TG_TOKEN_SET" = 1 ]    || TG_TOKEN="$(stored TG_TOKEN)"
   [ "$TG_CHAT_SET" = 1 ]     || TG_CHAT="$(stored TG_CHAT)"
   [ "$TG_THREAD_SET" = 1 ]   || TG_THREAD="$(stored TG_THREAD)"
+  if [ "$TG_LANG_SET" = 0 ] && grep -q '^TG_LANG=' "$ENVF"; then
+    TG_LANG="$(stored TG_LANG)"
+  fi
   # A line present but empty is a decision (metrics off) and survives; no line at all
   # is an install older than the option, which gets the default below.
   if [ "$METRICS_DIR_SET" = 0 ] && grep -q '^METRICS_DIR=' "$ENVF"; then
@@ -1031,6 +1039,7 @@ TG_TOKEN='$TG_TOKEN'
 TG_CHAT='$TG_CHAT'
 # Forum topic inside that chat (message_thread_id). Empty = the chat itself.
 TG_THREAD='$TG_THREAD'
+TG_LANG='$TG_LANG'
 # node_exporter textfile collector directory; the watchdog writes vps-psiphon.prom
 # there after every check. Empty = off.
 METRICS_DIR='$METRICS_DIR'
@@ -1477,11 +1486,56 @@ fi
 # config on stdin — never argv, where any local user could read it in ps.
 notify() {
   [ -n "${TG_TOKEN:-}" ] && [ -n "${TG_CHAT:-}" ] || return 0
+  local text="$1"
+  [ "${TG_LANG:-en}" != ru ] || text="$2"
   printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$TG_TOKEN" \
     | curl -s -o /dev/null --max-time 10 -K - \
         --data-urlencode "chat_id=${TG_CHAT}" \
         ${TG_THREAD:+--data-urlencode "message_thread_id=${TG_THREAD}"} \
-        --data-urlencode "text=vps-psiphon @ $(hostname): $*" >/dev/null 2>&1 || true
+        --data-urlencode "text=vps-psiphon @ $(hostname): $text" >/dev/null 2>&1 || true
+}
+
+# The watchdog keeps its technical reasons in the log and state file. Render
+# those reasons only when composing a Russian Telegram alert.
+tg_reason_ru() {
+  local reason="${1%%; also *}"
+  local country="${reason#*Google sees }" target="${reason#refused-by-target (}"
+  local requested accepted
+  local slow='^slow-tunnel \(([0-9]+) KB/s < ([0-9]+) KB/s floor\)$'
+  local timed='^slow-tunnel \(timed out after 25s at ([0-9]+) KB/s, ([0-9]+) bytes\)$'
+  if [[ "$reason" =~ $slow ]]; then
+    printf 'низкая скорость: %s КБ/с при минимуме %s КБ/с' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+  elif [[ "$reason" =~ $timed ]]; then
+    printf 'загрузка не завершилась за 25 с: %s КБ/с, получено %s байт' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+  else
+    case "$reason" in
+      socks-dead) printf 'SOCKS-прокси не ответил' ;;
+      stalled-tunnel*) printf 'SOCKS-прокси отвечает, но HTTP-ответа нет за 25 с' ;;
+      denied-country*) printf 'Google определил регион %s: он запрещён в настройках' "${country%% *}" ;;
+      wrong-country*)
+        requested="${reason#*; asked }"; accepted="${reason#*, accepted \'}"
+        printf 'регион по данным Google: %s; запрошен: %s; разрешены: %s' \
+          "${country%%;*}" "${requested%%,*}" "${accepted%\'\)}" ;;
+      refused-by-target*) printf 'сайт отказал в доступе через этот IP (%s)' "${target% through this exit)}" ;;
+      gemini-refused*) printf 'Gemini отказал в доступе (код 1060)' ;;
+      google-captcha*) printf 'Google перенаправил браузерную проверку на капчу (/sorry)' ;;
+      *) printf 'см. журнал: vps-psiphon watchdog' ;;
+    esac
+  fi
+  if [[ "$1" == *'; also '* ]]; then
+    printf '; также: '
+    tg_reason_ru "${1#*; also }"
+  fi
+}
+
+tg_gemini_ru() {
+  case "$1" in
+    'inconclusive (the message was sent to /sorry'*) printf 'проверка попала на страницу Google /sorry' ;;
+    'inconclusive (the check ran past 200 s'*) printf 'проверка не завершилась за 200 с' ;;
+    'inconclusive (page answered '*', without the session fields)'*|'inconclusive (the session fields'*) printf 'проверка не смогла прочитать данные сессии Gemini' ;;
+    'inconclusive (an answer without a reply'*|'inconclusive (no reply'*) printf 'Gemini не вернул ответ на тестовое сообщение' ;;
+    *) printf 'ответ не удалось распознать; детали в журнале vps-psiphon watchdog' ;;
+  esac
 }
 
 fails=0; last_rotate=0; captcha=0; window=""; rotations=0; last_reason=""; denied_gl=""
@@ -1582,13 +1636,15 @@ run_mode="$(awk '{print $2}' /var/lib/vps-psiphon-run.state 2>/dev/null)"
 if [ -n "$run_mode" ] && [ "$run_mode" != "$run_mode_seen" ]; then
   if [ "$run_mode" = unedited ]; then
     log "launcher could not edit psiphon.config: in-proxy is not excluded on this tunnel"
-    notify "the launcher could not edit psiphon.config (not in the shape it knows), so in-proxy is NOT kept out of this tunnel. See journalctl -u vps-psiphon and $CONF_DIR/psiphon.config"
+    notify "the launcher could not edit psiphon.config (not in the shape it knows), so in-proxy is NOT kept out of this tunnel. See journalctl -u vps-psiphon and $CONF_DIR/psiphon.config" \
+      "Не удалось обновить psiphon.config: туннель может использовать in-proxy. Детали: journalctl -u vps-psiphon и $CONF_DIR/psiphon.config"
   elif [ "$run_mode" = pending ]; then
     # The image seeded the config itself, so this tunnel runs on its template: in-proxy
     # not kept out, auto as SG. Every rotation starts on an empty directory, so until
     # the template can be read again (a changed image, say) no start ever catches up.
     log "launcher could not seed psiphon.config from the image: in-proxy is not excluded on this tunnel"
-    notify "the launcher could not seed psiphon.config from the image's template, so this tunnel runs on the image's own config: in-proxy is NOT kept out, and auto exits through the template's SG. Every rotation repeats this. See journalctl -u vps-psiphon"
+    notify "the launcher could not seed psiphon.config from the image's template, so this tunnel runs on the image's own config: in-proxy is NOT kept out, and auto exits through the template's SG. Every rotation repeats this. See journalctl -u vps-psiphon" \
+      "Не удалось подготовить psiphon.config. При каждом запуске используется конфиг образа: in-proxy может включиться, а автоматический режим выбирает SG. Детали: journalctl -u vps-psiphon"
   fi
   run_mode_seen="$run_mode"
 fi
@@ -1636,7 +1692,8 @@ else
     esac
     # Alerted once per country, not on every check until the rotation lands.
     if [ "$denied" = 1 ] && [ "$denied_gl" != "$gl" ]; then
-      notify "exit is seen as $gl (denied) — rotating once the failure window fills"
+      notify "exit is seen as $gl (denied) — rotating once the failure window fills" \
+        "Google определил регион $gl. Он запрещён в настройках; IP сменится, когда накопится достаточно неудачных проверок."
     fi
     [ "$denied" = 1 ] && denied_gl="$gl" || denied_gl=""
     # What we ASK Psiphon for and what we ACCEPT from Google are different lists:
@@ -1726,7 +1783,8 @@ else
     # Alerted once per refusal, like a denied country, not on every check until the
     # rotation lands.
     [ "$refused_seen" != "$refused" ] \
-      && notify "$refused through this exit — rotating once the failure window fills"
+      && notify "$refused through this exit — rotating once the failure window fills" \
+        "Сайт отказал в доступе через текущий IP ($refused). IP сменится, когда накопится достаточно неудачных проверок."
     refused_seen="$refused"
   else
     refused_seen=""
@@ -1770,7 +1828,8 @@ if [ "${GEMINI_CHECK:-1}" = 1 ] && [ "$alive" = 1 ] && [ "${ytcode:-000}" != 000
     if [ "$gem_streak" -ge "${GEMINI_STALE_CHECKS:-18}" ] && [ "$gem_stale_seen" = 0 ]; then
       gem_stale_seen=1
       log "gemini check has settled nothing for $gem_streak checks in a row — refusals are not being detected"
-      notify "the Gemini check has settled nothing for $gem_streak checks in a row (last: $gem). Refusals are not being detected: Google may have changed its answer, or Gemini fails for this host. Compare: vps-psiphon gemini --direct"
+      notify "the Gemini check has settled nothing for $gem_streak checks in a row (last: $gem). Refusals are not being detected: Google may have changed its answer, or Gemini fails for this host. Compare: vps-psiphon gemini --direct" \
+        "Gemini: проверок без результата подряд — $gem_streak. Последняя: $(tg_gemini_ru "$gem"). Пока нельзя определить, доступен ли Gemini через этот IP. Сравните с проверкой без туннеля: vps-psiphon gemini --direct"
     fi
   else
     [ "$gem_stale_seen" = 1 ] && log "gemini check settles again: $gem"
@@ -1782,7 +1841,8 @@ if [ "${GEMINI_CHECK:-1}" = 1 ] && [ "$alive" = 1 ] && [ "${ytcode:-000}" != 000
   if [ "${IMPERSONATE:-0}" = 1 ] && { [ ! -x /opt/vps-psiphon/curl-impersonate/curl-impersonate ] ||
        [ -z "$(find /opt/vps-psiphon/curl-impersonate -maxdepth 1 -regex '.*/curl_chrome[0-9]+' -print -quit 2>/dev/null)" ]; }; then
     [ "$imp_missing_seen" = 0 ] \
-      && notify "IMPERSONATE=1, but no curl-impersonate build is installed: the browser captcha is not watched. Re-run the installer to fetch one."
+      && notify "IMPERSONATE=1, but no curl-impersonate build is installed: the browser captcha is not watched. Re-run the installer to fetch one." \
+        "Включён IMPERSONATE=1, но curl-impersonate не установлен. Браузерная проверка капчи не работает. Для установки повторно запустите установщик."
     imp_missing_seen=1
   else
     imp_missing_seen=0
@@ -1861,17 +1921,21 @@ if [ "$due" = 1 ] && [ $((now - last_rotate)) -ge "$wait_s" ]; then
   log "rotated: $old -> $new"
   log_tunnels
   if [ -z "$new" ] || [ "$new" = '?' ]; then
-    notify "rotated away from $old (${last_reason:-?}) — and the new tunnel does not answer yet"
+    notify "rotated away from $old (${last_reason:-?}) — and the new tunnel does not answer yet" \
+      "Начата смена IP $old, но новый туннель пока не отвечает. Причина: $(tg_reason_ru "${last_reason:-?}")."
   else
-    notify "rotated $old -> $new${moved:+, region $moved} (${last_reason:-?})"
+    notify "rotated $old -> $new${moved:+, region $moved} (${last_reason:-?})" \
+      "Смена IP: $old → $new${moved:+, регион ${moved/ -> / → }}. Причина: $(tg_reason_ru "${last_reason:-?}")."
   fi
   # A refusal on the new exit is news again, so the once-only alerts start over.
   fails=0; window=""; last_rotate=$now; rotations=$((rotations + 1)); denied_gl=""; refused_seen=""
   futile=$(( futile + 1 ))
   if [ "$futile" -ge 3 ] && [ "$backoff_seen" = 0 ]; then
     backoff_seen=1
-    log "$futile rotations in a row without a passing check: backing off, the next waits $(cooldown_after "$futile")s"
-    notify "$futile rotations in a row have not brought a passing check (last: ${last_reason:-?}). The fault likely follows this host rather than the exit, so rotations now back off: the next in $(cooldown_after "$futile")s, at most every ${cap}s."
+    next_delay="$(cooldown_after "$futile")"
+    log "$futile rotations in a row without a passing check: backing off, the next waits ${next_delay}s"
+    notify "$futile rotations in a row have not brought a passing check (last: ${last_reason:-?}). The fault likely follows this host rather than the exit, so rotations now back off: the next in ${next_delay}s, at most every ${cap}s." \
+      "Неудачных смен IP подряд: $futile. Последняя причина: $(tg_reason_ru "${last_reason:-?}"). Проблема может быть на самой ноде, поэтому пауза увеличена: следующая попытка не раньше чем через $next_delay с, предел паузы — $cap с."
   fi
   # The tunnel just started is the one the next check judges, and it starts clean.
   this_tunnel="$(docker inspect -f '{{.State.StartedAt}}' "${NAME:-vps-psiphon}" 2>/dev/null)"
@@ -2213,7 +2277,9 @@ case "${1:-status}" in
       echo "Telegram alerts are off: set them with the installer's --tg-token and --tg-chat" >&2
       exit 1
     fi
-    code="$(notify "test message — alerts from this node reach this chat")"
+    text="test message — alerts from this node reach this chat"
+    [ "${TG_LANG:-en}" != ru ] || text="Тест: уведомления с этой ноды приходят в этот чат."
+    code="$(notify "$text")"
     if [ "$code" = 200 ]; then echo "sent"
     else echo "not sent (HTTP ${code:-no answer}) — check the token, the chat id, and that the bot is in the chat" >&2; exit 1
     fi ;;

@@ -36,7 +36,7 @@ refute() { if "$@"; then echo "expected to fail: $*" >&2; return 1; fi; }
 @test "installer refuses bad input before touching the system" {
   for args in "--region d" "--bind 1.2.3.999" "--bind ::1" "--socks-port 0" \
               "--socks-port 70000" "--memory 1x" "--device-region usa" \
-              "--tg-token nope" "--tg-chat x-y" "--tg-thread x" "--metrics-dir relative/path" \
+              "--tg-token nope" "--tg-chat x-y" "--tg-thread x" "--tg-lang de" "--tg-lang" "--metrics-dir relative/path" \
               "--accept DE,xyz" "--probe-urls http://plain.example/" \
               "--probe-urls https://x.example/a'b" "--probe-urls https://x.example/\$(id)"; do
     # shellcheck disable=SC2086
@@ -102,6 +102,21 @@ refute() { if "$@"; then echo "expected to fail: $*" >&2; return 1; fi; }
   printf "PROBE_URLS=''\n" > "$ENVF";                   apply; [ "$PROBE_URLS" = "" ]
   printf 'NAME=vps-psiphon\n' > "$ENVF";               apply; [ "$PROBE_URLS" = "$PROBE_URLS_DEFAULT" ]
   rm -f "$ENVF"
+}
+
+@test "reinstall keeps the Telegram language unless explicitly changed" {
+  block="$(sed -n '/^  if \[ "\$TG_LANG_SET" = 0 \] && grep -q/,/^  fi$/p' "$INSTALLER")"
+  [ -n "$block" ]
+  ENVF="$BATS_TEST_TMPDIR/vps-psiphon"
+  stored() { sed -n "s/^$1=//p" "$ENVF" | tr -d "'"; }
+  printf "TG_LANG='ru'\n" > "$ENVF"
+  TG_LANG=en; TG_LANG_SET=0; eval "$block"
+  [ "$TG_LANG" = ru ]
+  TG_LANG=en; TG_LANG_SET=1; eval "$block"
+  [ "$TG_LANG" = en ]
+  printf 'NAME=vps-psiphon\n' > "$ENVF"
+  TG_LANG=en; TG_LANG_SET=0; eval "$block"
+  [ "$TG_LANG" = en ]
 }
 
 # ------------------------------------------------------------------ verify --
@@ -458,6 +473,14 @@ put_shared_funcs '$f'"
   grep -q '^TG .*test message' "$STUB_LOG"
 }
 
+@test "cli: Russian Telegram test still goes to the configured topic" {
+  printf 'TG_LANG=ru\nTG_THREAD=10\n' >> "$ROOT/etc/default/vps-psiphon"
+  run_cli notify-test
+  [ "$status" -eq 0 ]
+  grep -q '^TG .*Тест: уведомления с этой ноды приходят в этот чат' "$STUB_LOG"
+  grep -qx 'TGTHREAD 10' "$STUB_LOG"
+}
+
 @test "cli: notify-test posts into the forum topic when TG_THREAD is set" {
   sed -i.bak "s/^TG_THREAD=.*/TG_THREAD='10'/" "$ROOT/etc/default/vps-psiphon"
   run_cli notify-test
@@ -620,6 +643,30 @@ GEM_ERROR_REPLY='[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],{\"11\":[\"Technical E
   grep -qx 'vps_psiphon_gemini_result 1' "$ROOT/metrics/vps-psiphon.prom"
 }
 
+@test "watchdog: Russian Telegram rotation keeps the IPs, region and refusal code" {
+  printf 'TG_LANG=ru\nTG_THREAD=10\n' >> "$ROOT/etc/default/vps-psiphon"
+  FAKE_GEM_OUT="$GEM_REFUSED_NEW" FAKE_ROTATED_IP=203.0.113.22 run_watchdog
+  rotated_fresh
+  wd_log | grep -q 'check failed (gemini-refused (error 1060'
+  grep -q '^TG .*Смена IP: 203.0.113.9 → 203.0.113.22, регион DE → NL. Причина: Gemini отказал в доступе (код 1060)' "$STUB_LOG"
+  grep -qx 'TGCHAT 42' "$STUB_LOG"
+  grep -qx 'TGTHREAD 10' "$STUB_LOG"
+  grep -qx 'vps_psiphon_gemini_result 1' "$ROOT/metrics/vps-psiphon.prom"
+}
+
+@test "watchdog: Russian Telegram speed alert keeps the measurement and the threshold" {
+  printf 'TG_LANG=ru\nFAIL_THRESHOLD=1\n' >> "$ROOT/etc/default/vps-psiphon"
+  FAKE_YT_W="544768 200" FAKE_YT_BODY="$(printf '"GL":"DE"%50000s' '')" run_watchdog
+  rotated_fresh
+  grep -q '^TG .*Причина: низкая скорость: 532 КБ/с при минимуме 800 КБ/с' "$STUB_LOG"
+}
+
+@test "watchdog: Russian Telegram wrong-region alert keeps all region values" {
+  printf "TG_LANG=ru\nFAIL_THRESHOLD=1\nACCEPT_REGIONS='DE NL'\n" >> "$ROOT/etc/default/vps-psiphon"
+  FAKE_YT_BODY='"GL":"FR"' run_watchdog
+  grep -q '^TG .*регион по данным Google: FR; запрошен: DE; разрешены: DE NL\.$' "$STUB_LOG"
+}
+
 @test "watchdog: a rotation starts the client on an empty config directory, region from the env" {
   mkdir -p "$ROOT/config/ca.psiphon.PsiphonTunnel.tunnel-core/datastore"
   echo servers > "$ROOT/config/ca.psiphon.PsiphonTunnel.tunnel-core/datastore/psiphon.boltdb"
@@ -698,6 +745,24 @@ GEM_ERROR_REPLY='[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],{\"11\":[\"Technical E
   run_watchdog
   wd_log | grep -q 'gemini check settles again'
   grep -qx 'vps_psiphon_gemini_inconclusive_streak 0' "$ROOT/metrics/vps-psiphon.prom"
+}
+
+@test "watchdog: Russian Telegram alert distinguishes Google /sorry from a refusal" {
+  printf 'TG_LANG=ru\nGEMINI_STALE_CHECKS=1\n' >> "$ROOT/etc/default/vps-psiphon"
+  export FAKE_GEM_OUT='<HTML><A HREF="https://www.google.com/sorry/index?continue=x">here</A>'
+  run_watchdog; run_watchdog
+  refute rotated
+  [ "$(grep -c '^TG .*Gemini: проверок без результата подряд' "$STUB_LOG")" -eq 1 ]
+  grep -q '^TG .*без результата подряд — 1.*страницу Google /sorry.*vps-psiphon gemini --direct' "$STUB_LOG"
+  grep -qx 'vps_psiphon_gemini_result 2' "$ROOT/metrics/vps-psiphon.prom"
+}
+
+@test "watchdog: Russian Telegram alert does not read quoted reply text as a redirect" {
+  printf 'TG_LANG=ru\nGEMINI_STALE_CHECKS=1\n' >> "$ROOT/etc/default/vps-psiphon"
+  FAKE_GEM_OUT='[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],null,null,[[\"rc_ab12\",[\"Gemini unavailable: sent to /sorry.\"]]]]"]]' run_watchdog
+  refute rotated
+  grep -q '^TG .*ответ не удалось распознать' "$STUB_LOG"
+  refute grep -q '^TG .*/sorry' "$STUB_LOG"
 }
 
 @test "watchdog: GEMINI_CHECK=0 does not ask Gemini" {

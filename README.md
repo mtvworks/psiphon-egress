@@ -308,7 +308,10 @@ Both are off unless configured.
   off, when the Gemini check has settled nothing for three hours, when the
   launcher could not edit `psiphon.config`, and when `--impersonate` is on without a build. Alerts go directly, not through the tunnel. The token is kept in
   `/etc/default/vps-psiphon` (mode 0600) and never passed on a command line.
-  `vps-psiphon notify-test` checks the setup.
+  `--tg-lang ru` sends Telegram alerts in Russian; `--tg-lang en` selects English
+  (the default). The language is kept on reinstall and does not change the
+  watchdog log or metrics. Applying the flag with the installer restarts the
+  tunnel as usual. `vps-psiphon notify-test` checks the setup.
 - **Prometheus**: if `/var/lib/node_exporter/textfile_collector` exists (or
   `--metrics-dir` points elsewhere), the watchdog writes `vps-psiphon.prom` there
   after every check: `vps_psiphon_up`, `vps_psiphon_check_ok`,

@@ -78,6 +78,7 @@ EOF
 #   FAKE_YT_RC    its exit status                  (default 0)
 #   FAKE_YT_BODY  its body                         (default 60 KB carrying GL DE)
 #   FAKE_IP       ipify answer                     (default 203.0.113.9)
+#   FAKE_ROTATED_IP  optional ipify answer after the watchdog starts the new tunnel
 #   FAKE_PROBE    status of a PROBE_URLS target on gemini.google.com (default 200);
 #                 a target on *.example times out (000, exit 28), like one that is down
 # The Gemini check (its page is the one fetched with -D):
@@ -135,7 +136,13 @@ case "$url" in
 esac
 case "$url" in
   *api.telegram.org*)
-    for d in "${data[@]}"; do case "$d" in text=*) echo "TG ${d#text=}" >> "$STUB_LOG" ;; message_thread_id=*) echo "TGTHREAD ${d#message_thread_id=}" >> "$STUB_LOG" ;; esac; done
+    for d in "${data[@]}"; do
+      case "$d" in
+        text=*) echo "TG ${d#text=}" >> "$STUB_LOG" ;;
+        chat_id=*) echo "TGCHAT ${d#chat_id=}" >> "$STUB_LOG" ;;
+        message_thread_id=*) echo "TGTHREAD ${d#message_thread_id=}" >> "$STUB_LOG" ;;
+      esac
+    done
     printf 200 ;;
   *generate_204*) printf '%s' "${FAKE_204:-204}" ;;
   *youtube*)
@@ -145,7 +152,12 @@ case "$url" in
     fi
     printf '%s' "${FAKE_YT_W:-2048000 200}"
     exit "${FAKE_YT_RC:-0}" ;;
-  *ipify*) printf '%s' "${FAKE_IP:-203.0.113.9}" ;;
+  *ipify*)
+    if [ -n "${FAKE_ROTATED_IP:-}" ] && grep -qx 'systemctl start vps-psiphon.service' "$STUB_LOG"; then
+      printf '%s' "$FAKE_ROTATED_IP"
+    else
+      printf '%s' "${FAKE_IP:-203.0.113.9}"
+    fi ;;
   *google.com/search*) : ;;
   *gemini.google.com*) echo "PROBE $url" >> "$STUB_LOG"; printf '%s' "${FAKE_PROBE:-200}" ;;
   *.example*) echo "PROBE $url" >> "$STUB_LOG"; printf '000'; exit 28 ;;
